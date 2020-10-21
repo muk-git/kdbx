@@ -1,0 +1,713 @@
+diff --git a/Makefile b/Makefile
+index 694111b..8a33b0b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -566,6 +566,7 @@ net-y		:= net/
+ libs-y		:= lib/
+ core-y		:= usr/
+ virt-y		:= virt/
++kdbx-y		:= kdbx/
+ endif # KBUILD_EXTMOD
+ 
+ ifeq ($(dot-config),1)
+@@ -634,7 +635,7 @@ else
+ ifdef CONFIG_PROFILE_ALL_BRANCHES
+ KBUILD_CFLAGS	+= -O2 $(call cc-disable-warning,maybe-uninitialized,)
+ else
+-KBUILD_CFLAGS   += -O2
++KBUILD_CFLAGS   += -O2 -fmax-errors=4
+ endif
+ endif
+ 
+@@ -753,6 +754,12 @@ ifdef CONFIG_DYNAMIC_FTRACE
+ endif
+ endif
+ 
++# ifeq ("$(origin kdbx)", "command line")
++ifeq ("$(kdbx)", "y")
++KBUILD_CFLAGS  += -DCONFIG_KDBX
++KBUILD_AFLAGS  += -DCONFIG_KDBX
++endif
++
+ # We trigger additional mismatches with less inlining
+ ifdef CONFIG_DEBUG_SECTION_MISMATCH
+ KBUILD_CFLAGS += $(call cc-option, -fno-inline-functions-called-once)
+@@ -905,6 +912,10 @@ export mod_sign_cmd
+ ifeq ($(KBUILD_EXTMOD),)
+ core-y		+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ block/
+ 
++ifeq ("$(kdbx)", "y")
++core-y         += kdbx/
++endif
++
+ vmlinux-dirs	:= $(patsubst %/,%,$(filter %/, $(init-y) $(init-m) \
+ 		     $(core-y) $(core-m) $(drivers-y) $(drivers-m) \
+ 		     $(net-y) $(net-m) $(libs-y) $(libs-m) $(virt-y)))
+diff --git a/arch/x86/entry/entry_64.S b/arch/x86/entry/entry_64.S
+index ef766a3..f5feac1 100644
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@ -527,6 +527,14 @@ ret_from_intr:
+ 	/* Restore saved previous stack */
+ 	popq	%rsp
+ 
++#ifdef CONFIG_KDBX
++        testl $1, kdbx_session_begun(%rip)
++        jz 1f
++        testl $3, CS(%rsp)
++        je retint_kernel                /* ret directly to kernel space */
++        jmp retint_user                 /* straignt to user space */
++1:
++#endif
+ 	testb	$3, CS(%rsp)
+ 	jz	retint_kernel
+ 
+@@ -1165,6 +1173,57 @@ END(error_exit)
+ 
+ /* Runs on exception stack */
+ ENTRY(nmi)
++#ifdef CONFIG_KDBX
++        /* kdbx doesn't allow nested NMI. The nasty nested NMI code copies
++         * eflags from orig place to new place, thus setting eflags to TF
++         * in kdbx does not work */
++
++	pushq	$-1			/* ORIG_RAX: no syscall to restart */
++	ALLOC_PT_GPREGS_ON_STACK
++
++	/*
++	 * Use paranoid_entry to handle SWAPGS, but no need to use paranoid_exit
++	 * as we should not be calling schedule in NMI context.
++	 * Even with normal interrupts enabled. An NMI should not be
++	 * setting NEED_RESCHED or anything that normal interrupts and
++	 * exceptions might do.
++	 */
++	call	paranoid_entry
++
++	/* paranoidentry do_nmi, 0; without TRACE_IRQS_OFF */
++	movq	%rsp, %rdi
++	movq	$-1, %rsi
++	call	do_nmi
++
++	testl	%ebx, %ebx			/* swapgs needed? */
++	jnz	2f
++	SWAPGS_UNSAFE_STACK
++2:
++	RESTORE_EXTRA_REGS
++	RESTORE_C_REGS
++
++	/* Point RSP at the "iret" frame. */
++	REMOVE_PT_GPREGS_FROM_STACK 1*8
++
++	/*
++	 * Clear "NMI executing".  Set DF first so that we can easily
++	 * distinguish the remaining code between here and IRET from
++	 * the SYSCALL entry and exit paths.  On a native kernel, we
++	 * could just inspect RIP, but, on paravirt kernels,
++	 * INTERRUPT_RETURN can translate into a jump into a
++	 * hypercall page.
++	 */
++	std
++
++	/*
++	 * INTERRUPT_RETURN reads the "iret" frame and exits the NMI
++	 * stack in a single instruction.  We are returning to kernel
++	 * mode, so this cannot result in a fault.
++	 */
++	INTERRUPT_RETURN
++END(nmi)
++#endif
++
+ 	/*
+ 	 * Fix up the exception frame if we're on Xen.
+ 	 * PARAVIRT_ADJUST_EXCEPTION_FRAME is guaranteed to push at most
+diff --git a/arch/x86/kernel/dumpstack.c b/arch/x86/kernel/dumpstack.c
+index 85f854b..a358599 100644
+--- a/arch/x86/kernel/dumpstack.c
++++ b/arch/x86/kernel/dumpstack.c
+@@ -247,6 +247,10 @@ int __die(const char *str, struct pt_regs *regs, long err)
+ 	       debug_pagealloc_enabled()  ? " DEBUG_PAGEALLOC" : "",
+ 	       IS_ENABLED(CONFIG_KASAN)   ? " KASAN"           : "");
+ 
++#ifdef CONFIG_KDBX
++        kdbxp("Kernel Panic... Entering kdbx\n");
++        kdbxmain_fatal(regs, err);
++#endif
+ 	if (notify_die(DIE_OOPS, str, regs, err,
+ 			current->thread.trap_nr, SIGSEGV) == NOTIFY_STOP)
+ 		return 1;
+diff --git a/arch/x86/kernel/nmi.c b/arch/x86/kernel/nmi.c
+index bfe4d6c..eb75923 100644
+--- a/arch/x86/kernel/nmi.c
++++ b/arch/x86/kernel/nmi.c
+@@ -503,6 +503,13 @@ static DEFINE_PER_CPU(int, update_debug_stack);
+ dotraplinkage notrace void
+ do_nmi(struct pt_regs *regs, long error_code)
+ {
++#ifdef CONFIG_KDBX
++{
++    extern void kdbx_do_nmi(struct pt_regs *regs, int err_code, int guest_call);
++    kdbx_do_nmi(regs, error_code, 0);
++    return;
++}
++#endif
+ 	if (this_cpu_read(nmi_state) != NMI_NOT_RUNNING) {
+ 		this_cpu_write(nmi_state, NMI_LATCHED);
+ 		return;
+diff --git a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
+index 9c337b0..5ec29d6 100644
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -897,6 +897,12 @@ void __init setup_arch(char **cmdline_p)
+ 	early_cpu_init();
+ 	early_ioremap_init();
+ 
++#ifdef CONFIG_KDBX
++        kdbx_init(boot_command_line);
++        if ( strstr(boot_command_line, "earlykdbx") )
++            kdbx_trap_immed(KDBX_TRAP_NONFATAL);
++#endif
++
+ 	setup_olpc_ofw_pgd();
+ 
+ 	ROOT_DEV = old_decode_dev(boot_params.hdr.root_dev);
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index bd4e3d4..ebcf1b3 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -529,6 +529,21 @@ NOKPROBE_SYMBOL(do_general_protection);
+ /* May run on IST stack. */
+ dotraplinkage void notrace do_int3(struct pt_regs *regs, long error_code)
+ {
++#ifdef CONFIG_KDBX
++        {
++#if 0
++            extern cpumask_t kdbx_cpu_traps;
++            int ccpu = smp_processor_id();
++
++            /* Called with INTs disabled, so we can do this here instead of
++             * int3(), caller of this */
++            asm("lock btsl %1,%0" : "+m"(kdbx_cpu_traps) : "Ir" (ccpu));
++#endif
++            if (kdbx_handle_trap_entry(X86_TRAP_BP, regs))
++                    return;
++        }
++#endif
++
+ #ifdef CONFIG_DYNAMIC_FTRACE
+ 	/*
+ 	 * ftrace must be first, everything else may cause a recursive crash.
+@@ -673,6 +688,11 @@ dotraplinkage void do_debug(struct pt_regs *regs, long error_code)
+ 	unsigned long dr6;
+ 	int si_code;
+ 
++#ifdef CONFIG_KDBX
++        if (kdbx_handle_trap_entry(X86_TRAP_DB, regs))
++                return;
++#endif
++
+ 	ist_enter(regs);
+ 
+ 	get_debugreg(dr6, 6);
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 5382b82..d1d01a5 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -5536,6 +5536,10 @@ static int handle_exception(struct kvm_vcpu *vcpu)
+ 		kvm_queue_exception_e(vcpu, AC_VECTOR, error_code);
+ 		return 1;
+ 	case DB_VECTOR:
++#ifdef CONFIG_KDBX
++                if ( kdbx_handle_guest_trap(DB_VECTOR, vcpu) )
++                    return 1;   /* handled */
++#endif
+ 		dr6 = vmcs_readl(EXIT_QUALIFICATION);
+ 		if (!(vcpu->guest_debug &
+ 		      (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP))) {
+@@ -5551,6 +5555,10 @@ static int handle_exception(struct kvm_vcpu *vcpu)
+ 		kvm_run->debug.arch.dr7 = vmcs_readl(GUEST_DR7);
+ 		/* fall through */
+ 	case BP_VECTOR:
++#ifdef CONFIG_KDBX
++                if ( kdbx_handle_guest_trap(BP_VECTOR, vcpu) )
++                    return 1;   /* handled */
++#endif
+ 		/*
+ 		 * Update instruction length as we may reinject #BP from
+ 		 * user space while in guest debugging mode. Reading it for
+@@ -6455,6 +6463,7 @@ static __init int hardware_setup(void)
+ 
+ 	if (enable_ept && !cpu_has_vmx_ept_2m_page())
+ 		kvm_disable_largepages();
++kvm_disable_largepages();
+ 
+ 	if (!cpu_has_vmx_ple())
+ 		ple_gap = 0;
+@@ -8613,6 +8622,11 @@ static void vmx_complete_atomic_exit(struct vcpu_vmx *vmx)
+ 	/* We need to handle NMIs before interrupts are enabled */
+ 	if ((exit_intr_info & INTR_INFO_INTR_TYPE_MASK) == INTR_TYPE_NMI_INTR &&
+ 	    (exit_intr_info & INTR_INFO_VALID_MASK)) {
++#ifdef CONFIG_KDBX
++                /* nmi from kdb main cpu */
++                kdbx_handle_guest_trap(2, &vmx->vcpu);
++                return;
++#endif
+ 		kvm_before_handle_nmi(&vmx->vcpu);
+ 		asm("int $2");
+ 		kvm_after_handle_nmi(&vmx->vcpu);
+@@ -8884,6 +8898,18 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ 
+ 	vmx_arm_hv_timer(vcpu);
+ 
++#ifdef CONFIG_KDBX
++        if ( vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP ) 
++            vmcs_writel(GUEST_RFLAGS, vmcs_readl(GUEST_RFLAGS) | X86_EFLAGS_TF);
++
++        if ( vcpu->guest_debug & KVM_GUESTDBG_USE_SW_BP ) {
++            int eb = vmcs_read32(EXCEPTION_BITMAP) | 1u << BP_VECTOR;
++            vmcs_write32(EXCEPTION_BITMAP, eb);
++        } else {
++            int eb = vmcs_read32(EXCEPTION_BITMAP) & ~(1u << BP_VECTOR);
++            vmcs_write32(EXCEPTION_BITMAP, eb);
++        }
++#endif
+ 	vmx->__launched = vmx->loaded_vmcs->launched;
+ 	asm(
+ 		/* Store host registers */
+@@ -9044,6 +9070,12 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ 
+ 	vmx->nested.nested_run_pending = 0;
+ 
++#ifdef CONFIG_KDBX
++        vcpu->arch.regs[VCPU_REGS_RIP] = vmcs_readl(GUEST_RIP);
++        vcpu->arch.regs[VCPU_REGS_RSP] = vmcs_readl(GUEST_RSP);
++        vcpu->guest_debug &= ~KVM_GUESTDBG_SINGLESTEP;
++        vmcs_writel(GUEST_RFLAGS, vmcs_readl(GUEST_RFLAGS) & ~X86_EFLAGS_TF);
++#endif
+ 	vmx_complete_atomic_exit(vmx);
+ 	vmx_recover_nmi_blocking(vmx);
+ 	vmx_complete_interrupts(vmx);
+@@ -11373,5 +11405,342 @@ static void __exit vmx_exit(void)
+ 	kvm_exit();
+ }
+ 
++#ifdef CONFIG_KDBX
++
++struct kvm_vcpu *vcpu_from_vmcs(struct vmcs *vmcs)
++{
++    int i;
++    struct list_head *lp;
++
++    if (vmcs == NULL)
++        return NULL;
++
++    /* vm_list part of struct kvm in kvm_host.h */
++    list_for_each(lp, &vm_list) {
++        struct kvm *kp = list_entry(lp, struct kvm, vm_list);  /* container of*/
++
++        for (i = 0; i < KVM_MAX_VCPUS; i++) {
++            struct vcpu_vmx *vx;
++            struct kvm_vcpu *vp = kp->vcpus[i];
++
++            if (vp == NULL)
++                continue;
++
++            vx = to_vmx(vp); 
++            if ( vx->loaded_vmcs && vx->loaded_vmcs->vmcs == vmcs )
++                return vp;
++        }
++    }
++    return NULL;
++}
++
++void kdbx_ret_curr_vcpu_info(struct kvm_vcpu **vpp, struct vmcs **vmcspp,
++                             struct vmcs **vmxapp)
++{
++    int ccpu = raw_smp_processor_id();
++    struct vmcs *vmcs = per_cpu(current_vmcs, ccpu);
++    struct vmcs *vmxa = per_cpu(vmxarea, ccpu);
++
++    if ( !enable_ept )
++        kdbxp(">>>> WARNING: ept is not enabled... \n");
++
++    if ( vmcspp )
++        *vmcspp = vmcs;
++    if ( vmxapp )
++        *vmxapp = vmxa;
++    if ( vpp )
++        *vpp = vcpu_from_vmcs(vmcs);
++}
++
++void kdbx_display_vvmx(struct kvm_vcpu *vp)
++{
++    struct vcpu_vmx *vv = (struct vcpu_vmx *)vp;
++
++    if ( vv == NULL )
++        return;
++
++    kdbxp("vmx:\n");
++    kdbxp("  host_rsp:%016lx rflags:%016lx fail:%x\n", vv->host_rsp,
++          vv->rflags, vv->fail);
++    kdbxp("  exit_reason:%x exit_intr_info:%x idt_vectoring_info:%x\n",
++          vv->exit_reason, vv->exit_intr_info, vv->idt_vectoring_info);
++    kdbxp("  vpid:%x emulation_required:%d vcpu rdtscp_enabled:%d\n",
++          vv->vpid, vv->emulation_required, guest_cpuid_has_rdtscp(vp));
++    kdbxp("  host_kernel_gs_base:%016lx guest_kernel_gs_base:%016lx\n",
++          vv->msr_host_kernel_gs_base, vv->msr_guest_kernel_gs_base);
++}
++
++static void kdbx_vmx_dump_sel(char *name, uint32_t selector)
++{
++    uint32_t sel, attr, limit;
++    uint64_t base;
++
++    sel = vmcs_read32(selector);
++    attr = vmcs_read32(selector + (GUEST_ES_AR_BYTES - GUEST_ES_SELECTOR));
++    limit = vmcs_read32(selector + (GUEST_ES_LIMIT - GUEST_ES_SELECTOR));
++    base = vmcs_read64(selector + (GUEST_ES_BASE - GUEST_ES_SELECTOR));
++    kdbxp("%s: sel=0x%04x, attr=0x%05x, limit=0x%08x, base=0x%016lx\n",
++          name, sel, attr, limit, base);
++}
++
++static void kdbx_vmx_dump_sel2(char *name, uint32_t lim)
++{
++    uint32_t limit;
++    uint64_t base;
++
++    limit = vmcs_read32(lim);
++    base = vmcs_read64(lim + (GUEST_GDTR_BASE - GUEST_GDTR_LIMIT));
++    kdbxp("%s:                           limit=0x%08x, base=0x%016lx\n",
++          name, limit, base);
++}
++
++static void noinline kdbx_print_vmcs(void)
++{
++    kdbxp("*** Guest State ***\n");
++    kdbxp("CR0: actual=0x%016llx shadow=0x%016llx ghmask=%016llx\n",
++         (unsigned long long)vmcs_readl(GUEST_CR0),
++         (unsigned long long)vmcs_readl(CR0_READ_SHADOW), 
++         (unsigned long long)vmcs_readl(CR0_GUEST_HOST_MASK));
++    kdbxp("CR4: actual=0x%016llx shadow=0x%016llx ghmask=%016llx\n",
++         (unsigned long long)vmcs_readl(GUEST_CR4),
++         (unsigned long long)vmcs_readl(CR4_READ_SHADOW), 
++         (unsigned long long)vmcs_readl(CR4_GUEST_HOST_MASK));
++    kdbxp("CR3: actual=0x%016llx, target_count=%d\n",
++         (unsigned long long)vmcs_readl(GUEST_CR3),
++         vmcs_read32(CR3_TARGET_COUNT));
++    kdbxp("     target0=%016llx, target1=%016llx\n",
++         (unsigned long long)vmcs_readl(CR3_TARGET_VALUE0),
++         (unsigned long long)vmcs_readl(CR3_TARGET_VALUE1));
++    kdbxp("     target2=%016llx, target3=%016llx\n",
++         (unsigned long long)vmcs_readl(CR3_TARGET_VALUE2),
++         (unsigned long long)vmcs_readl(CR3_TARGET_VALUE3));
++    kdbxp("RSP = 0x%016llx RIP = 0x%016llx\n", 
++         (unsigned long long)vmcs_readl(GUEST_RSP),
++         (unsigned long long)vmcs_readl(GUEST_RIP));
++    kdbxp("RFLAGS=0x%016llx DR7 = 0x%016llx\n", 
++         (unsigned long long)vmcs_readl(GUEST_RFLAGS),
++         (unsigned long long)vmcs_readl(GUEST_DR7));
++    kdbxp("Sysenter RSP=%016llx CS:RIP=%04x:%016llx\n",
++         (unsigned long long)vmcs_readl(GUEST_SYSENTER_ESP),
++         vmcs_read32(GUEST_SYSENTER_CS),
++         (unsigned long long)vmcs_readl(GUEST_SYSENTER_EIP));
++    kdbx_vmx_dump_sel("CS", GUEST_CS_SELECTOR);
++    kdbx_vmx_dump_sel("DS", GUEST_DS_SELECTOR);
++    kdbx_vmx_dump_sel("SS", GUEST_SS_SELECTOR);
++    kdbx_vmx_dump_sel("ES", GUEST_ES_SELECTOR);
++    kdbx_vmx_dump_sel("FS", GUEST_FS_SELECTOR);
++    kdbx_vmx_dump_sel("GS", GUEST_GS_SELECTOR);
++    kdbx_vmx_dump_sel2("GDTR", GUEST_GDTR_LIMIT);
++    kdbx_vmx_dump_sel("LDTR", GUEST_LDTR_SELECTOR);
++    kdbx_vmx_dump_sel2("IDTR", GUEST_IDTR_LIMIT);
++    kdbx_vmx_dump_sel("TR", GUEST_TR_SELECTOR);
++    kdbxp("Guest EFER = %016llx %016llx\n", vmcs_read64(GUEST_IA32_EFER),
++          vmcs_read64(GUEST_IA32_PAT));
++    kdbxp("TSC Offset = %016llx\n", vmcs_read64(TSC_OFFSET));
++    kdbxp("DebugCtl=%016llx DebugExceptions=%016llx\n", 
++           vmcs_read64(GUEST_IA32_DEBUGCTL),
++           (unsigned long long)vmcs_readl(GUEST_PENDING_DBG_EXCEPTIONS));
++    kdbxp("Interruptibility=%04x ActivityState=%04x\n",
++           vmcs_read32(GUEST_INTERRUPTIBILITY_INFO),
++           vmcs_read32(GUEST_ACTIVITY_STATE));
++
++    kdbxp("MSRs: entry_load:$%d exit_load:$%d exit_store:$%d\n",
++         vmcs_read32(VM_ENTRY_MSR_LOAD_COUNT), 
++         vmcs_read32(VM_EXIT_MSR_LOAD_COUNT),
++         vmcs_read32(VM_EXIT_MSR_STORE_COUNT));
++
++    kdbxp("\n*** Host State ***\n");
++    kdbxp("RSP = 0x%016llx  RIP = 0x%016llx\n", 
++           (unsigned long long)vmcs_readl(HOST_RSP),
++           (unsigned long long)vmcs_readl(HOST_RIP));
++    kdbxp("CS=%04x DS=%04x ES=%04x FS=%04x GS=%04x SS=%04x TR=%04x\n",
++           vmcs_read16(HOST_CS_SELECTOR),
++           vmcs_read16(HOST_DS_SELECTOR),
++           vmcs_read16(HOST_ES_SELECTOR),
++           vmcs_read16(HOST_FS_SELECTOR),
++           vmcs_read16(HOST_GS_SELECTOR),
++           vmcs_read16(HOST_SS_SELECTOR),
++           vmcs_read16(HOST_TR_SELECTOR));
++    kdbxp("FSBase=%016llx GSBase=%016llx TRBase=%016llx\n",
++           (unsigned long long)vmcs_readl(HOST_FS_BASE),
++           (unsigned long long)vmcs_readl(HOST_GS_BASE),
++           (unsigned long long)vmcs_readl(HOST_TR_BASE));
++    kdbxp("GDTBase=%016llx IDTBase=%016llx\n",
++           (unsigned long long)vmcs_readl(HOST_GDTR_BASE),
++           (unsigned long long)vmcs_readl(HOST_IDTR_BASE));
++    kdbxp("CR0=%016llx CR3=%016llx CR4=%016llx\n",
++           (unsigned long long)vmcs_readl(HOST_CR0),
++           (unsigned long long)vmcs_readl(HOST_CR3),
++           (unsigned long long)vmcs_readl(HOST_CR4));
++    kdbxp("Sysenter RSP=%016llx CS:RIP=%04x:%016llx\n",
++           (unsigned long long)vmcs_readl(HOST_IA32_SYSENTER_ESP),
++           vmcs_read32(HOST_IA32_SYSENTER_CS),
++           (unsigned long long)vmcs_readl(HOST_IA32_SYSENTER_EIP));
++    kdbxp("Host PAT = 0x%08x%08x\n",
++           vmcs_read32(HOST_IA32_PAT_HIGH), vmcs_read32(HOST_IA32_PAT));
++
++    kdbxp("\n*** Control State ***\n");
++    kdbxp("PinBased=%08x CPUBased=%08x SecondaryExec=%08x\n",
++           vmcs_read32(PIN_BASED_VM_EXEC_CONTROL),
++           vmcs_read32(CPU_BASED_VM_EXEC_CONTROL),
++           vmcs_read32(SECONDARY_VM_EXEC_CONTROL));
++    kdbxp("EntryControls=%08x ExitControls=%08x\n",
++           vmcs_read32(VM_ENTRY_CONTROLS), vmcs_read32(VM_EXIT_CONTROLS));
++    kdbxp("ExceptionBitmap=%08x\n", vmcs_read32(EXCEPTION_BITMAP));
++    kdbxp("PAGE_FAULT_ERROR_CODE  MASK:0x%lx  MATCH:0x%lx\n", 
++         vmcs_read32(PAGE_FAULT_ERROR_CODE_MASK),
++         vmcs_read32(PAGE_FAULT_ERROR_CODE_MATCH));
++    kdbxp("VMEntry: intr_info=%08x errcode=%08x ilen=%08x\n",
++           vmcs_read32(VM_ENTRY_INTR_INFO_FIELD),
++           vmcs_read32(VM_ENTRY_EXCEPTION_ERROR_CODE),
++           vmcs_read32(VM_ENTRY_INSTRUCTION_LEN));
++    kdbxp("VMExit: intr_info=%08x errcode=%08x ilen=%08x\n",
++           vmcs_read32(VM_EXIT_INTR_INFO),
++           vmcs_read32(VM_EXIT_INTR_ERROR_CODE),
++           vmcs_read32(VM_ENTRY_INSTRUCTION_LEN));
++    kdbxp("        reason=%08x qualification=%08x\n",
++           vmcs_read32(VM_EXIT_REASON), vmcs_readl(EXIT_QUALIFICATION));
++    kdbxp("IDTVectoring: info=%08x errcode=%08x\n",
++           vmcs_read32(IDT_VECTORING_INFO_FIELD),
++           vmcs_read32(IDT_VECTORING_ERROR_CODE));
++    kdbxp("TPR Threshold = 0x%02x\n", vmcs_read32(TPR_THRESHOLD));
++    kdbxp("EPT pointer = 0x%08x%08x\n", vmcs_read64(EPT_POINTER));
++    kdbxp("Virtual processor ID = 0x%04x\n", vmcs_read16(VIRTUAL_PROCESSOR_ID));
++    kdbxp("================================================================\n");
++}
++
++/* Flush VMCS on this cpu if it needs to: 
++ *   - Upon leaving kdb, the HVM cpu will resume in vmx_vmexit_handler() and 
++ *     do __vmreads. So, the VMCS pointer can't be left cleared.
++ *   - Doing __vmpclear will set the vmx state to 'clear', so to resume a
++ *     vmlaunch must be done and not vmresume. This means, we must clear 
++ *     arch_vmx->launched.
++ */
++void kdbx_curr_cpu_flush_vmcs(void)
++{
++    int ccpu = raw_smp_processor_id();
++    struct vmcs *vmcs = per_cpu(current_vmcs, ccpu);
++    struct kvm_vcpu *vcpu = vcpu_from_vmcs(vmcs);
++    struct vcpu_vmx *vmx = to_vmx(vcpu);
++
++    if (vmcs == NULL)
++        return;
++
++    if (vcpu == NULL) {
++        kdbxp("[%d]Bummer! Unable to find vcpu for vmcs:%p\n", ccpu, vmcs);
++        return;
++    }
++    if ( vmx->loaded_vmcs->launched == 0 )
++        return;
++
++kdbxp("[%d]:flushing vmcs\n", ccpu);
++
++    /* main kdbx cpu will load each vmcs and print it. so we just need to 
++     * make sure vmcs has what the cpu has. vmclear changes the launched 
++     * state to clear, after which a vmlaunch must be done, not vmresume */
++    vmcs_clear(vmcs);
++    vmx->loaded_vmcs->launched = 0;
++    vmcs_load(vmcs);
++}
++
++/* return : true if field succesfully found and loaded */
++static ulong kdbx_extract_vmcs_field(uint field)
++{
++    switch (field) {
++#if 0
++        case HOST_RSP :
++            // return vv->host_rsp;
++            return vmcs_read64(HOST_RSP);
++#endif
++
++        case GUEST_CR3:
++            return vmcs_readl(GUEST_CR3);
++
++        default:
++            kdbxp(">>>>>>>>>>>>> Illegal vmcs field:%d\n", field);
++    }
++    return 0xdeadbeefdeadbeef;
++}
++
++/* PreCondition: all cpus (including current cpu) have flushed VMCS */
++static ulong kdbx_vmcs_stuff(struct kvm_vcpu *in_vp, int field)
++{
++    extern void kdbx_cpu_flush_vmcs(int tgt_cpu);
++    int i;
++    struct list_head *lp;
++    ulong retval = 0xdeadbeefdeadbeef;
++    int ccpu = raw_smp_processor_id();
++    struct vmcs *vmcs = per_cpu(current_vmcs, ccpu);
++
++    if ( !enable_ept )
++        kdbxp(">>>> WARNING: ept is not enabled... \n");
++
++    if (vmcs) {
++        struct kvm_vcpu *vcpu = vcpu_from_vmcs(vmcs);
++        struct vcpu_vmx *vmx = to_vmx(vcpu);
++
++        vmcs_clear(vmcs);
++
++        if (vmx == NULL)
++            kdbxp("Unable to find vmx for vmcs:%\n", vmcs);
++        else
++            vmx->loaded_vmcs->launched = 0;
++    }
++
++    /* vm_list part of struct kvm in kvm_host.h */
++    list_for_each(lp, &vm_list) {
++        struct kvm *kp = list_entry(lp, struct kvm, vm_list);  /* container of*/
++
++        for (i = 0; i < KVM_MAX_VCPUS; i++) {
++            struct kvm_vcpu *vp = kp->vcpus[i];
++            struct vcpu_vmx *vx = to_vmx(vp); 
++
++            if ( in_vp && in_vp != vp )
++                continue;
++
++            if ( !vp || !vx->loaded_vmcs || !vx->loaded_vmcs->vmcs )
++                continue;
++
++            if ( vx->loaded_vmcs->launched ) {
++                if ( vx->loaded_vmcs->cpu == ccpu )
++                    kdbx_curr_cpu_flush_vmcs();
++                else
++                    kdbx_cpu_flush_vmcs(vx->loaded_vmcs->cpu);
++            }
++
++            vmcs_load(vx->loaded_vmcs->vmcs);
++
++            if ( field == ~0 ) {
++                kdbxp("vcpu:[id:%d]%p  vmcs:%p kvm:%p\n", vp->vcpu_id, vp,
++                      vx->loaded_vmcs->vmcs, kp);
++                kdbx_print_vmcs();
++                vmcs_clear(vx->loaded_vmcs->vmcs);
++            } else  {
++                retval = kdbx_extract_vmcs_field(field);
++                vmcs_clear(vx->loaded_vmcs->vmcs);
++                goto out;
++            }
++
++        }
++    }
++out:
++    if (vmcs)
++        vmcs_load(vmcs);
++
++    return retval;
++}
++
++void kdbx_dump_vmcs(struct kvm_vcpu *vp)
++{
++    kdbx_vmcs_stuff(vp, ~0);
++}
++
++ulong kdbx_get_vmcs_field(struct kvm_vcpu *vp, uint field)
++{
++    return kdbx_vmcs_stuff(vp, field);
++}
++
++#endif  /* CONFIG_KDBX */
++
+ module_init(vmx_init)
+ module_exit(vmx_exit)
+diff --git a/drivers/tty/serial/8250/8250_port.c b/drivers/tty/serial/8250/8250_port.c
+index 1731b98..1eb9d93 100644
+--- a/drivers/tty/serial/8250/8250_port.c
++++ b/drivers/tty/serial/8250/8250_port.c
+@@ -1687,6 +1687,12 @@ static void serial8250_read_char(struct uart_8250_port *up, unsigned char lsr)
+ 		else if (lsr & UART_LSR_FE)
+ 			flag = TTY_FRAME;
+ 	}
++#ifdef CONFIG_KDBX
++        if ( ch == 0x1c ) {
++                if ( kdbx_keyboard(get_irq_regs()) )
++                        return;
++        }
++#endif
+ 	if (uart_handle_sysrq_char(port, ch))
+ 		return;
+ 
+diff --git a/include/linux/printk.h b/include/linux/printk.h
+index eac1af8..1cd6801 100644
+--- a/include/linux/printk.h
++++ b/include/linux/printk.h
+@@ -7,6 +7,11 @@
+ #include <linux/linkage.h>
+ #include <linux/cache.h>
+ 
++#ifdef CONFIG_KDBX
++/* everybody includes printk.h, so put it here */
++#include "../../kdbx/include/kdbx_linux.h"
++#endif
++
+ extern const char linux_banner[];
+ extern const char linux_proc_banner[];
+ 
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index e9c009d..6f224d5 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -3259,6 +3259,10 @@ static inline int test_tsk_thread_flag(struct task_struct *tsk, int flag)
+ 
+ static inline void set_tsk_need_resched(struct task_struct *tsk)
+ {
++#ifdef CONFIG_KDBX
++    if ( kdbx_session_begun )
++        return;
++#endif
+ 	set_tsk_thread_flag(tsk,TIF_NEED_RESCHED);
+ }
+ 
+diff --git a/kernel/time/clocksource.c b/kernel/time/clocksource.c
+index 7e4fad7..f970f26 100644
+--- a/kernel/time/clocksource.c
++++ b/kernel/time/clocksource.c
+@@ -314,6 +314,9 @@ static void clocksource_enqueue_watchdog(struct clocksource *cs)
+ {
+ 	unsigned long flags;
+ 
++#ifdef CONFIG_KDBX
++        return;
++#endif
+ 	spin_lock_irqsave(&watchdog_lock, flags);
+ 	if (cs->flags & CLOCK_SOURCE_MUST_VERIFY) {
+ 		/* cs is a clocksource to be watched. */
+diff --git a/kernel/watchdog.c b/kernel/watchdog.c
+index 9acb29f..1bf38c1 100644
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@ -46,11 +46,15 @@
+ 
+ static DEFINE_MUTEX(watchdog_proc_mutex);
+ 
++#ifdef CONFIG_KDBX
++static unsigned long __read_mostly watchdog_enabled = 0;
++#else
+ #ifdef CONFIG_HARDLOCKUP_DETECTOR
+ static unsigned long __read_mostly watchdog_enabled = SOFT_WATCHDOG_ENABLED|NMI_WATCHDOG_ENABLED;
+ #else
+ static unsigned long __read_mostly watchdog_enabled = SOFT_WATCHDOG_ENABLED;
+ #endif
++#endif
+ int __read_mostly nmi_watchdog_enabled;
+ int __read_mostly soft_watchdog_enabled;
+ int __read_mostly watchdog_user_enabled;

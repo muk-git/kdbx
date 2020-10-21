@@ -1,0 +1,134 @@
+diff --git a/Makefile b/Makefile
+index 7b4d995..8deb5d7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -748,6 +748,10 @@ endif
+ ifeq ("$(kdbx)", "y")
+ KBUILD_CFLAGS  += -DCONFIG_KDBX
+ KBUILD_AFLAGS  += -DCONFIG_KDBX
++ifeq ("$(dom0kdbx)", "y")
++KBUILD_CFLAGS  += -DCONFIG_KDBX_FOR_XEN_DOM0
++KBUILD_AFLAGS  += -DCONFIG_KDBX_FOR_XEN_DOM0
++endif
+ endif
+ 
+ # We trigger additional mismatches with less inlining
+diff --git a/arch/x86/kernel/entry_64.S b/arch/x86/kernel/entry_64.S
+index bd79247..cf4ca5c 100644
+--- a/arch/x86/kernel/entry_64.S
++++ b/arch/x86/kernel/entry_64.S
+@@ -1648,6 +1648,10 @@ ENTRY(nmi)
+          * eflags from orig place to new place, thus setting eflags to TF
+          * in kdbx does not work */
+ 
++#ifdef CONFIG_KDBX_FOR_XEN_DOM0
++        /* pop extra rcx and r11 from the stack due to syscall/sysretq calls */
++        PARAVIRT_ADJUST_EXCEPTION_FRAME
++#endif
+         CFI_STARTPROC
+ 	pushq	$-1			/* ORIG_RAX: no syscall to restart */
+ 	ALLOC_PT_GPREGS_ON_STACK
+diff --git a/drivers/tty/hvc/hvc_console.c b/drivers/tty/hvc/hvc_console.c
+index 4fcec1d..c328ee1 100644
+--- a/drivers/tty/hvc/hvc_console.c
++++ b/drivers/tty/hvc/hvc_console.c
+@@ -612,6 +612,12 @@ int hvc_poll(struct hvc_struct *hp)
+ 	int read_total = 0;
+ 	int written_total = 0;
+ 
++#ifdef CONFIG_KDBX_FOR_XEN_DOM0
++        /* kdbx is polling. in case of ss/ni, if we don't do this, momentarily
++         * we leave kdbx, and xen will virq, and this will inject into tty */
++        if (kdbx_session_begun)
++            return 0;
++#endif
+ 	spin_lock_irqsave(&hp->lock, flags);
+ 
+ 	/* Push pending writes */
+@@ -667,6 +673,21 @@ int hvc_poll(struct hvc_struct *hp)
+ 			}
+ 			break;
+ 		}
++
++#ifdef CONFIG_KDBX_FOR_XEN_DOM0
++		if (hp->index == hvc_console.index) {
++		        for (i = 0; i < n; ++i) {
++				if (buf[i] == '\x1f') {   /* "ctrl /" */	
++                                    if ( kdbx_keyboard(get_irq_regs()) ) {
++                                        read_total = 0;
++                                        poll_mask = 0;
++                                        goto bail;
++                                    }
++                                }
++                        }
++                }
++#endif /* CONFIG_KDBX_FOR_XEN_DOM0 */
++
+ 		for (i = 0; i < n; ++i) {
+ #ifdef CONFIG_MAGIC_SYSRQ
+ 			if (hp->index == hvc_console.index) {
+diff --git a/drivers/tty/hvc/hvc_xen.c b/drivers/tty/hvc/hvc_xen.c
+index fa816b7..3a4376f 100644
+--- a/drivers/tty/hvc/hvc_xen.c
++++ b/drivers/tty/hvc/hvc_xen.c
+@@ -170,7 +170,7 @@ static struct hv_ops domU_hvc_ops = {
+ 	.notifier_hangup = notifier_hangup_irq,
+ };
+ 
+-static int dom0_read_console(uint32_t vtermno, char *buf, int len)
++int noinline dom0_read_console(uint32_t vtermno, char *buf, int len)
+ {
+ 	return HYPERVISOR_console_io(CONSOLEIO_read, len, buf);
+ }
+@@ -179,7 +179,7 @@ static int dom0_read_console(uint32_t vtermno, char *buf, int len)
+  * Either for a dom0 to write to the system console, or a domU with a
+  * debug version of Xen
+  */
+-static int dom0_write_console(uint32_t vtermno, const char *str, int len)
++int noinline dom0_write_console(uint32_t vtermno, const char *str, int len)
+ {
+ 	int rc = HYPERVISOR_console_io(CONSOLEIO_write, len, (char *)str);
+ 	if (rc < 0)
+diff --git a/drivers/tty/serial/8250/8250_core.c b/drivers/tty/serial/8250/8250_core.c
+index 474a405..a8da376 100644
+--- a/drivers/tty/serial/8250/8250_core.c
++++ b/drivers/tty/serial/8250/8250_core.c
+@@ -1531,12 +1531,14 @@ serial8250_rx_chars(struct uart_8250_port *up, unsigned char lsr)
+ 				flag = TTY_FRAME;
+ 		}
+ 
++#ifndef CONFIG_KDBX_FOR_XEN_DOM0
+ #ifdef CONFIG_KDBX
+         if ( ch == 0x1c ) {
+                 if ( kdbx_keyboard(get_irq_regs()) )
+                         goto ignore_char;
+         }
+ #endif
++#endif
+ 		if (uart_handle_sysrq_char(port, ch))
+ 			goto ignore_char;
+ 
+diff --git a/drivers/xen/events/events_base.c b/drivers/xen/events/events_base.c
+index d4b9983..afc306a 100644
+--- a/drivers/xen/events/events_base.c
++++ b/drivers/xen/events/events_base.c
+@@ -1725,3 +1725,19 @@ void __init xen_init_IRQ(void)
+ 	}
+ #endif
+ }
++
++#ifdef CONFIG_KDBX_FOR_XEN_DOM0
++void kdbx_dump_guest_evtchn(void)
++{
++    uint irq, evtchn;
++
++    kdbxp("evtchn#  irq# (all decimal):\n");
++
++    for ( evtchn = 1; evtchn < xen_evtchn_max_channels(); evtchn++ ) {
++        if ( (irq = get_evtchn_to_irq(evtchn)) == -1 )
++            continue;
++
++        kdbxp("[%3d]   %d\n", evtchn, irq);
++    }
++}
++#endif
