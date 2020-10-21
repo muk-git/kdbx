@@ -1,0 +1,10 @@
+
+http://udis86.sourceforge.net/
+udis86-1.6 : 
+  - cd libudis86
+  - cp *c to here
+  - cp *h to here
+   
+Mukesh Rathor
+04/30/2008
+
