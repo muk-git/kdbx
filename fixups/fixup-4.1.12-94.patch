@@ -1,0 +1,216 @@
+diff --git a/.gitignore b/.gitignore
+index 51079b0..759eea9 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,6 +9,8 @@
+ #
+ # Normal rules
+ #
++*.orig
++*.rej
+ .*
+ *.o
+ *.o.*
+diff --git a/Makefile b/Makefile
+index 3150e03..b25bccd 100644
+--- a/Makefile
++++ b/Makefile
+@@ -401,6 +401,8 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
+ 		   -fno-strict-aliasing -fno-common \
+ 		   -Werror-implicit-function-declaration \
+ 		   -Wno-format-security \
++		   -fmax-errors=4 -Werror=return-type -Werror=int-conversion \
++		   -Werror=misleading-indentation       \
+ 		   -std=gnu89
+ 
+ KBUILD_AFLAGS_KERNEL :=
+@@ -789,6 +791,9 @@ KBUILD_CPPFLAGS += $(ARCH_CPPFLAGS) $(KCPPFLAGS)
+ KBUILD_AFLAGS   += $(ARCH_AFLAGS)   $(KAFLAGS)
+ KBUILD_CFLAGS   += $(ARCH_CFLAGS)   $(KCFLAGS)
+ 
++#Mukesh: Add ours after all flgs are set, so our setting is at the end
++KBUILD_CFLAGS   += -Wno-error=date-time 
++
+ # Use --build-id when available.
+ LDFLAGS_BUILD_ID = $(patsubst -Wl$(comma)%,%,\
+ 			      $(call cc-ldoption, -Wl$(comma)--build-id,))
+diff --git a/arch/x86/kernel/cpu/mcheck/mce.c b/arch/x86/kernel/cpu/mcheck/mce.c
+index ff78767..e9b8e4e 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@ -1096,7 +1096,7 @@ int do_machine_check(struct pt_regs *regs, long error_code)
+ 		mcgstatus = mce_rdmsrl(MSR_IA32_MCG_STATUS);
+ 		if (mcgstatus & MCG_STATUS_RIPV) {
+ 			mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
+-			return;
++			return 0;
+ 		}
+ 	}
+ 
+diff --git a/arch/x86/kernel/ldt.c b/arch/x86/kernel/ldt.c
+index 17ad4e1..fe85279 100644
+--- a/arch/x86/kernel/ldt.c
++++ b/arch/x86/kernel/ldt.c
+@@ -39,7 +39,7 @@ static void __free_ldt_struct(struct ldt_struct *ldt)
+ 	if (ldt->size * LDT_ENTRY_SIZE > PAGE_SIZE)
+ 		vfree(ldt->entries);
+ 	else
+-		kfree((unsigned long)ldt->entries);
++		kfree((void *)ldt->entries);
+ 	kfree(ldt);
+ }
+ 
+diff --git a/drivers/infiniband/hw/sif/Makefile b/drivers/infiniband/hw/sif/Makefile
+index 825e82e..54d33bf 100644
+--- a/drivers/infiniband/hw/sif/Makefile
++++ b/drivers/infiniband/hw/sif/Makefile
+@@ -1,5 +1,6 @@
+ ccflags-y +=  -DSIF_TRACE_MASK \
+-  -Wno-packed-bitfield-compat -Werror
++  -Wno-packed-bitfield-compat -Werror \
++  -Wno-error=frame-address
+ 
+ obj-$(CONFIG_INFINIBAND_SIF) := sif.o
+ 
+diff --git a/drivers/infiniband/ulp/xsigo/xve/xve_ib.c b/drivers/infiniband/ulp/xsigo/xve/xve_ib.c
+index d5d4b2a..1ae5d04 100644
+--- a/drivers/infiniband/ulp/xsigo/xve/xve_ib.c
++++ b/drivers/infiniband/ulp/xsigo/xve/xve_ib.c
+@@ -102,7 +102,7 @@ static void xve_ud_skb_put_frags(struct xve_dev_priv *priv,
+ 	else
+ 		size = length;
+ 
+-		skb->tail += size;
++	skb->tail += size;
+ 	skb->len += size;
+ 	length -= size;
+ 
+diff --git a/drivers/infiniband/ulp/xsigo/xve/xve_main.c b/drivers/infiniband/ulp/xsigo/xve/xve_main.c
+index 77481dd..c891fc9 100644
+--- a/drivers/infiniband/ulp/xsigo/xve/xve_main.c
++++ b/drivers/infiniband/ulp/xsigo/xve/xve_main.c
+@@ -974,12 +974,13 @@ static int xve_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 			if (!xve_is_edr(priv) && (xve_do_arp
+ 			    || (priv->netdev->mtu >
+ 				XVE_UD_MTU(priv->max_ib_mtu))))
+-
++                        {
+ 				bcast_skb = xve_generate_query(priv, skb);
+ 				if (bcast_skb != NULL)
+ 					ret = xve_mcast_send(dev,
+ 						       (void *)priv->bcast_mgid.
+ 						       raw, bcast_skb, 1);
++                        }
+ 			/*
+ 			 * Now send the original packet also to over broadcast
+ 			 * Later add counters for flood mode
+diff --git a/drivers/net/ethernet/dec/tulip/uli526x.c b/drivers/net/ethernet/dec/tulip/uli526x.c
+index 2c30c0c..3195d0f 100644
+--- a/drivers/net/ethernet/dec/tulip/uli526x.c
++++ b/drivers/net/ethernet/dec/tulip/uli526x.c
+@@ -1083,7 +1083,7 @@ static void uli526x_timer(unsigned long data)
+ 			db->cr6_data&=~0x00000200;	/* bit9=0, HD mode */
+ 			update_cr6(db->cr6_data, db->ioaddr);
+ 		}
+-	} else
++	} else {
+ 		if ((tmp_cr12 & 0x3) && db->link_failed) {
+ 			ULI526X_DBUG(0, "Link link OK", tmp_cr12);
+ 			db->link_failed = 0;
+@@ -1116,7 +1116,7 @@ static void uli526x_timer(unsigned long data)
+ 			}
+ 		}
+ 		db->init=0;
+-
++        }
+ 	/* Timer active again */
+ 	db->timer.expires = ULI526X_TIMER_WUT;
+ 	add_timer(&db->timer);
+diff --git a/drivers/scsi/mvsas/mv_sas.c b/drivers/scsi/mvsas/mv_sas.c
+index 9c78074..253fbb4 100644
+--- a/drivers/scsi/mvsas/mv_sas.c
++++ b/drivers/scsi/mvsas/mv_sas.c
+@@ -733,12 +733,13 @@ static int mvs_task_prep(struct sas_task *task, struct mvs_info *mvi, int is_tmf
+ 		if (mvi_dev)
+ 			mv_dprintk("device %d not ready.\n",
+ 				mvi_dev->device_id);
+-		else
++		else {
+ 			mv_dprintk("device %016llx not ready.\n",
+ 				SAS_ADDR(dev->sas_addr));
+ 
+ 			rc = SAS_PHY_DOWN;
+ 			return rc;
++                }
+ 	}
+ 	tei.port = dev->port->lldd_port;
+ 	if (tei.port && !tei.port->port_attached && !tmf) {
+diff --git a/drivers/scsi/storvsc_drv.c b/drivers/scsi/storvsc_drv.c
+index dbc9d9a..fb60658 100644
+--- a/drivers/scsi/storvsc_drv.c
++++ b/drivers/scsi/storvsc_drv.c
+@@ -1650,12 +1650,13 @@ static int storvsc_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *scmnd)
+ 				      sizeof(struct vmbus_packet_mpb_array));
+ 			payload = kmalloc(payload_sz, GFP_ATOMIC);
+ 			if (!payload) {
+-				if (cmd_request->bounce_sgl_count)
++				if (cmd_request->bounce_sgl_count) {
+ 					destroy_bounce_buffer(
+ 					cmd_request->bounce_sgl,
+ 					cmd_request->bounce_sgl_count);
+ 
+ 					return SCSI_MLQUEUE_DEVICE_BUSY;
++                                }
+ 			}
+ 		}
+ 
+diff --git a/drivers/target/target_core_pr.c b/drivers/target/target_core_pr.c
+index 08aa7cc..57fd4e1 100644
+--- a/drivers/target/target_core_pr.c
++++ b/drivers/target/target_core_pr.c
+@@ -329,7 +329,7 @@ static int core_scsi3_pr_seq_non_holder(
+ 			 * RESERVATION CONFLICT on some CDBs */
+ 
+ 	if (!se_sess->se_node_acl->device_list)
+-		return;
++		return 0;
+ 
+ 	se_deve = se_sess->se_node_acl->device_list[cmd->orig_fe_lun];
+ 	/*
+diff --git a/include/linux/compiler-gcc6.h b/include/linux/compiler-gcc6.h
+new file mode 120000
+index 0000000..9489f09
+--- /dev/null
++++ b/include/linux/compiler-gcc6.h
+@@ -0,0 +1 @@
++/sb/linux/nano-4.1.12-94.6.6/include/linux/compiler-gcc5.h
+\ No newline at end of file
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 048d0d6..e226544 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1622,7 +1622,7 @@ static struct task_struct *copy_process(unsigned long clone_flags,
+ 	 */
+ 	if (p->mm && stack_start) {
+ 		dtrace_psinfo_alloc(p);
+-		p->dtrace_psinfo->ustack = stack_start;
++		p->dtrace_psinfo->ustack = (void *)stack_start;
+ 	}
+ 
+ 	/*
+diff --git a/net/rds/rdma_transport.c b/net/rds/rdma_transport.c
+index 16aa421..2ff56ee 100644
+--- a/net/rds/rdma_transport.c
++++ b/net/rds/rdma_transport.c
+@@ -43,7 +43,7 @@
+ 
+ #define RDS_REJ_CONSUMER_DEFINED 28
+ 
+-int unload_allowed __initdata;
++int unload_allowed;
+ 
+ module_param_named(module_unload_allowed, unload_allowed, int, 0);
+ MODULE_PARM_DESC(module_unload_allowed, "Allow this module to be unloaded or not (default 0 for NO)");
+-- 
+2.7.5
+

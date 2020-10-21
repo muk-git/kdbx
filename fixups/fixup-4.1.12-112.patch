@@ -1,0 +1,69 @@
+diff --git a/.gitignore b/.gitignore
+index 51079b0..759eea9 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,6 +9,8 @@
+ #
+ # Normal rules
+ #
++*.orig
++*.rej
+ .*
+ *.o
+ *.o.*
+diff --git a/Makefile b/Makefile
+index 3150e03..b25bccd 100644
+--- a/Makefile
++++ b/Makefile
+@@ -401,6 +401,8 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
+ 		   -fno-strict-aliasing -fno-common \
+ 		   -Werror-implicit-function-declaration \
+ 		   -Wno-format-security \
++		   -fmax-errors=4 -Werror=return-type -Werror=int-conversion \
++		   -Werror=misleading-indentation       \
+ 		   -std=gnu89
+ 
+ KBUILD_AFLAGS_KERNEL :=
+@@ -789,6 +791,9 @@ KBUILD_CPPFLAGS += $(ARCH_CPPFLAGS) $(KCPPFLAGS)
+ KBUILD_AFLAGS   += $(ARCH_AFLAGS)   $(KAFLAGS)
+ KBUILD_CFLAGS   += $(ARCH_CFLAGS)   $(KCFLAGS)
+ 
++#Mukesh: Add ours after all flgs are set, so our setting is at the end
++KBUILD_CFLAGS   += -Wno-error=date-time 
++
+ # Use --build-id when available.
+ LDFLAGS_BUILD_ID = $(patsubst -Wl$(comma)%,%,\
+ 			      $(call cc-ldoption, -Wl$(comma)--build-id,))
+diff --git a/arch/x86/kernel/cpu/mcheck/mce.c b/arch/x86/kernel/cpu/mcheck/mce.c
+index ff78767..e9b8e4e 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@ -1096,7 +1096,7 @@ int do_machine_check(struct pt_regs *regs, long error_code)
+ 		mcgstatus = mce_rdmsrl(MSR_IA32_MCG_STATUS);
+ 		if (mcgstatus & MCG_STATUS_RIPV) {
+ 			mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
+-			return;
++			return 0;
+ 		}
+ 	}
+ 
+diff --git a/drivers/infiniband/hw/sif/Makefile b/drivers/infiniband/hw/sif/Makefile
+index 825e82e..54d33bf 100644
+--- a/drivers/infiniband/hw/sif/Makefile
++++ b/drivers/infiniband/hw/sif/Makefile
+@@ -1,5 +1,6 @@
+ ccflags-y +=  -DSIF_TRACE_MASK \
+-  -Wno-packed-bitfield-compat -Werror
++  -Wno-packed-bitfield-compat -Werror \
++  -Wno-error=frame-address
+ 
+ obj-$(CONFIG_INFINIBAND_SIF) := sif.o
+ 
+diff --git a/include/linux/compiler-gcc6.h b/include/linux/compiler-gcc6.h
+new file mode 120000
+index 0000000..9489f09
+--- /dev/null
++++ b/include/linux/compiler-gcc6.h
+@@ -0,0 +1 @@
++/sb/linux/nano-4.1.12-94.6.6/include/linux/compiler-gcc5.h
+\ No newline at end of file

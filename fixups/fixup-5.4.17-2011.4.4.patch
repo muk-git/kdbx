@@ -1,0 +1,59 @@
+From 76e2f050b3f342835d2da045192f4c707d72a9d7 Mon Sep 17 00:00:00 2001
+From: Mukesh Rathor <mukesh.rathor@oracle.com>
+Date: Wed, 22 Jul 2020 17:38:47 -0700
+Subject: [PATCH] mukesh: apply fixup
+
+---
+ .gitignore | 12 ++++++++++++
+ Makefile   |  5 +++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/.gitignore b/.gitignore
+index bc9164db98a3..1541fa141d73 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,6 +9,18 @@
+ #
+ # Normal rules (sorted alphabetically)
+ #
++config.muk
++config-4.14*
++config-5.4*
++okvmstat
++kdbx
++*.diff
++*.sav
++vmioctl
++*.orig
++*.rej
++*.old
++*.prev
+ .*
+ *.a
+ *.asn1.[ch]
+diff --git a/Makefile b/Makefile
+index 96bf8219a73d..584b931b8950 100644
+--- a/Makefile
++++ b/Makefile
+@@ -459,6 +459,8 @@ KBUILD_CFLAGS   := -Wall -Wundef -Werror=strict-prototypes -Wno-trigraphs \
+ 		   -fno-strict-aliasing -fno-common -fshort-wchar -fno-PIE \
+ 		   -Werror=implicit-function-declaration -Werror=implicit-int \
+ 		   -Wno-format-security \
++		   -fmax-errors=4 -Werror=return-type -Werror=int-conversion \
++		   -Werror=misleading-indentation       \
+ 		   -std=gnu89
+ KBUILD_CPPFLAGS := -D__KERNEL__
+ KBUILD_AFLAGS_KERNEL :=
+@@ -917,6 +919,9 @@ KBUILD_CPPFLAGS += $(KCPPFLAGS)
+ KBUILD_AFLAGS   += $(KAFLAGS)
+ KBUILD_CFLAGS   += $(KCFLAGS)
+ 
++#Mukesh: Add ours after all flgs are set, so our setting is at the end
++KBUILD_CFLAGS   += -Wno-error=date-time
++
+ KBUILD_LDFLAGS_MODULE += --build-id
+ LDFLAGS_vmlinux += --build-id
+ 
+-- 
+2.17.2
+

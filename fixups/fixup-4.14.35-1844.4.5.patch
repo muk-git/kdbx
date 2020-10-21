@@ -1,0 +1,52 @@
+diff --git a/.gitignore b/.gitignore
+index 689b85dd3e16..0393d4f66e62 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,6 +9,11 @@
+ #
+ # Normal rules (sorted alphabetically)
+ #
++okvmstat
++*.orig
++*.rej
++*.old
++*.prev
+ .*
+ *.a
+ *.bin
+diff --git a/Makefile b/Makefile
+index 20af1567eddf..1bdcfaf9932b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -419,6 +419,8 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
+ 		   -fno-strict-aliasing -fno-common -fshort-wchar \
+ 		   -Werror-implicit-function-declaration \
+ 		   -Wno-format-security \
++		   -fmax-errors=4 -Werror=return-type -Werror=int-conversion \
++		   -Werror=misleading-indentation       \
+ 		   -std=gnu89
+ KBUILD_CPPFLAGS := -D__KERNEL__
+ KBUILD_AFLAGS_KERNEL :=
+@@ -851,6 +853,9 @@ KBUILD_CPPFLAGS += $(ARCH_CPPFLAGS) $(KCPPFLAGS)
+ KBUILD_AFLAGS   += $(ARCH_AFLAGS)   $(KAFLAGS)
+ KBUILD_CFLAGS   += $(ARCH_CFLAGS)   $(KCFLAGS)
+ 
++#Mukesh: Add ours after all flgs are set, so our setting is at the end
++KBUILD_CFLAGS   += -Wno-error=date-time 
++
+ # Use --build-id when available.
+ LDFLAGS_BUILD_ID := $(patsubst -Wl$(comma)%,%,\
+ 			      $(call cc-ldoption, -Wl$(comma)--build-id,))
+diff --git a/drivers/vhost/Kconfig b/drivers/vhost/Kconfig
+index cfdecea5078f..b580885243f7 100644
+--- a/drivers/vhost/Kconfig
++++ b/drivers/vhost/Kconfig
+@@ -12,7 +12,7 @@ config VHOST_NET
+ 
+ config VHOST_SCSI
+ 	tristate "VHOST_SCSI TCM fabric driver"
+-	depends on TARGET_CORE && EVENTFD && m
++	depends on TARGET_CORE && EVENTFD
+ 	select VHOST
+ 	default n
+ 	---help---
