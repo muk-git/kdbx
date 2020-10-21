@@ -25,6 +25,7 @@
 #include <linux/types.h>
 #include <linux/cpumask.h>
 #include <linux/delay.h>
+#include <linux/version.h>
 #include <asm/nmi.h>
 #include <asm/desc_defs.h>
 #include <asm/desc.h>
@@ -50,7 +51,9 @@
 #include <linux/memblock.h>
 #include <linux/compiler.h>
 #include <linux/kernel.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
 #include <linux/kmemcheck.h>
+#endif
 #include <linux/suspend.h>
 #include <linux/pagevec.h>
 #include <linux/blkdev.h>
@@ -87,9 +90,15 @@
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <linux/tcp.h>
+#include <linux/virtio_config.h>
 #include <net/ip.h>
-#include <linux/version.h>
+#include <linux/platform_device.h>
+#include <linux/serial_8250.h>
+#include <asm/serial.h>
+#include <kvm/iodev.h>
 #include "../../kernel/sched/sched.h"
+#include "../drivers/tty/serial/8250/8250.h"
+#include "../drivers/vhost/vhost.h"
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
 #include <asm/text-patching.h>

@@ -34,9 +34,9 @@ static int kdb_read_byte_for_ud(struct ud *udp)
     kdbbyt_t bytebuf;
     kdbva_t addr = kdb_ud_rd_info.kud_instr_addr;
     pid_t gpid = kdb_ud_rd_info.kud_gpid;
-    struct kvm_vcpu *vp = kdb_pid_to_vcpu(gpid, 0);
+    struct kvm_vcpu *vp = kdbx_pid_to_vcpu(gpid, 0);
 
-    if (kdb_read_mem(addr, &bytebuf, 1, vp) == 1) {
+    if (kdbx_read_mem(addr, &bytebuf, 1, vp) == 1) {
         kdb_ud_rd_info.kud_instr_addr++;
         KDBGP1("udrd:addr:%lx gpid:%d byte:%x\n", addr, gpid, bytebuf);
         return bytebuf;
@@ -45,41 +45,56 @@ static int kdb_read_byte_for_ud(struct ud *udp)
     return UD_EOI;
 }
 
+/* convert addr to symbol and return in buf
+ * if gpid == -1, just return addr in buf
+ * NOTE: buf size must be KSYM_NAME_LEN+16 (for guestpid prefix) */
+char *kdbx_addr2sym(pid_t gpid, kdbva_t addr, char *buf, int needoffs)
+{
+    unsigned long sz, offs, symfound = 0;
+    char prefix[8], *p = buf;
+
+    prefix[0] = '\0';     /* guest pid */
+    snprintf(buf, KSYM_NAME_LEN+16, " (null) ");
+
+    if ( gpid != -1 && addr ) {
+        if ( gpid ) {
+            snprintf(prefix, 8, "%d:", gpid);
+            p = kdbx_guest_addr2sym(addr, gpid, &offs);
+            if ( p )
+                symfound = 1;
+        } else {
+            kallsyms_lookup(addr, &sz, &offs, NULL, buf);
+            if ( *buf )
+                symfound = 1;
+        }
+    }
+    if ( symfound ) {
+        if ( needoffs )
+            snprintf(buf, KSYM_NAME_LEN+16, "%s%s+%lx", prefix, p, offs);
+        else
+            snprintf(buf, KSYM_NAME_LEN+16, "%s%s", prefix, p);
+    } else
+        snprintf(buf, KSYM_NAME_LEN+16, " %s%016lx ", prefix, addr);
+
+    return buf;
+}
+
 /* 
  * convert addr to symbol and print it 
  * Eg: ffff828c801235e2: idle_loop+52                  jmp  idle_loop+55
  *    Called twice here for idle_loop. In first case, nl is null, 
  *    in the second case nl == '\n'
  */
-void kdb_prnt_addr2sym(pid_t gpid, kdbva_t addr, char *nl)
+void kdbx_prnt_addr2sym(pid_t gpid, kdbva_t addr, char *nl)
 {
-    unsigned long sz, offs, pnull = 1;
-    char buf[KSYM_NAME_LEN+1], pbuf[150], prefix[8];
-    char *p = buf;
+    char buf[KSYM_NAME_LEN+16]; 
 
-    prefix[0] = '\0';     /* guest pid */
-    snprintf(pbuf, 150, " (null) ");
-
-    if ( addr ) {
-        if ( gpid ) {
-            snprintf(prefix, 8, "%d:", gpid);
-            p = kdb_guest_addr2sym(addr, gpid, &offs);
-            pnull = 0;
-        } else {
-            kallsyms_lookup(addr, &sz, &offs, NULL, buf);
-            if ( buf[0] != 0 )
-                pnull = 0;
-        }
-    }
-    if ( pnull )
-        snprintf(pbuf, 150, "%016lx", addr);
-    else
-        snprintf(pbuf, 150, "%s%s+%lx", prefix, p, offs);
+    kdbx_addr2sym(gpid, addr, buf, 1);
 
     if (*nl != '\n')
-        kdbxp("%-28s%s", pbuf, nl);  /* prints more than 30 if needed */
+        kdbxp("%-28s%s", buf, nl);  /* prints more than 30 if needed */
     else
-        kdbxp("%s%s", pbuf, nl);
+        kdbxp("%s%s", buf, nl);
 }
 
 static int kdb_jump_instr(enum ud_mnemonic_code mnemonic)
@@ -113,7 +128,7 @@ static void kdb_print_one_instr(struct ud *udp, pid_t gpid)
         for(p=ud_insn_asm(udp); (*q=*p) && *p!=' '; p++,q++);
         *q='\0';
         kdbxp(" %-4s ", ibuf);    /* space before for long func names */
-        kdb_prnt_addr2sym(gpid, addr, "\n");
+        kdbx_prnt_addr2sym(gpid, addr, "\n");
     } else
         kdbxp(" %-24s\n", ud_insn_asm(udp));
 #if 0
@@ -132,7 +147,7 @@ static void kdb_setup_ud(struct ud *udp, kdbva_t addr, pid_t gpid)
 
     KDBGP1("setup_ud:addr:%lx gpid:%d\n", addr, gpid);
     ud_init(udp);
-    ud_set_mode(udp, gpid ? kdb_guest_bitness(gpid) : 64); /* host always 64 */
+    ud_set_mode(udp, gpid ? kdbx_guest_bitness(gpid) : 64);/* host always 64 */
     ud_set_syntax(udp, dis_syntax); 
     ud_set_vendor(udp, vendor);           /* HVM: vmx/svm different instrs*/
     ud_set_pc(udp, addr);                 /* for numbers printed on left */
@@ -145,7 +160,7 @@ static void kdb_setup_ud(struct ud *udp, kdbva_t addr, pid_t gpid)
  * given an addr, print given number of instructions.
  * Returns: address of next instruction in the stream
  */
-kdbva_t kdb_print_instr(kdbva_t addr, long num, pid_t gpid)
+kdbva_t kdbx_print_instr(kdbva_t addr, long num, pid_t gpid)
 {
     struct ud ud_s;
 
@@ -157,7 +172,7 @@ kdbva_t kdb_print_instr(kdbva_t addr, long num, pid_t gpid)
             uint64_t pc = ud_insn_off(&ud_s);
 
             kdbxp("%016lx: ", pc);
-            kdb_prnt_addr2sym(gpid, pc, "");
+            kdbx_prnt_addr2sym(gpid, pc, "");
             kdb_print_one_instr(&ud_s, gpid);
         } else
             kdbxp("KDB:Couldn't disassemble PC:0x%lx\n", addr);
@@ -171,7 +186,7 @@ kdbva_t kdb_print_instr(kdbva_t addr, long num, pid_t gpid)
 /* check if the instr at the addr is call instruction
  * RETURNS: size of the instr if it's a call instr, else 0
  */
-int kdb_check_call_instr(kdbva_t addr, pid_t gpid)
+int kdbx_check_call_instr(kdbva_t addr, pid_t gpid)
 {
     struct ud ud_s;
     int sz;
@@ -184,7 +199,7 @@ int kdb_check_call_instr(kdbva_t addr, pid_t gpid)
 }
 
 /* toggle ATT and Intel syntaxes */
-void kdb_toggle_dis_syntax(void)
+void kdbx_toggle_dis_syntax(void)
 {
     if (dis_syntax == UD_SYN_INTEL) {
         dis_syntax = UD_SYN_ATT;

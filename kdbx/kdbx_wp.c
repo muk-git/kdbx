@@ -82,8 +82,7 @@ kdb_set_dr7_rw(int regno, kdbma_t *dr7p, int rw)
 }
 
 /* get value of a debug register: DR0-DR3 DR6 DR7. other values return 0 */
-kdbma_t
-kdb_rd_dbgreg(int regnum)
+kdbma_t kdbx_rd_dbgreg(int regnum)
 {
     kdbma_t contents = 0;
 
@@ -137,11 +136,10 @@ kdb_print_wp_info(char *strp, int idx)
  * Returns : 0 if not one of ours
  *           1 if one of ours
  */
-int
-kdb_check_watchpoints(struct pt_regs *regs)
+int kdbx_check_watchpoints(struct pt_regs *regs)
 {
     int wpnum;
-    kdbma_t dr6 = kdb_rd_dbgreg(6);
+    kdbma_t dr6 = kdbx_rd_dbgreg(6);
 
     KDBGP1("check_wp: IP:%lx EFLAGS:%lx\n", regs->ip, regs->flags);
     if (dr6 & DR6_B0)
@@ -161,8 +159,7 @@ kdb_check_watchpoints(struct pt_regs *regs)
 
 /* set a watchpoint at a given address 
  * PreCondition: addr != 0 */
-static void
-kdb_set_wp(kdbva_t addr, int rwflag, int len)
+static void kdb_set_wp(kdbva_t addr, int rwflag, int len)
 {
     int regno;
 
@@ -187,8 +184,7 @@ kdb_set_wp(kdbva_t addr, int rwflag, int len)
 }
 
 /* write reg DR0-3 with address. Update corresponding bits in DR7 */
-static void
-kdb_install_watchpoint(int regno, kdbma_t *dr7p)
+static void kdb_install_watchpoint(int regno, kdbma_t *dr7p)
 {
     kdb_set_gx_in_dr7(regno, dr7p);
     kdb_set_len_in_dr7(regno, dr7p, kdb_wpa[regno].wp_len); 
@@ -201,8 +197,7 @@ kdb_install_watchpoint(int regno, kdbma_t *dr7p)
 }
 
 /* clear G0-G3 bits in DR7 for given DR0-3 */
-static void
-kdb_clear_dr7_gx(int regno, kdbma_t *dr7p)
+static void kdb_clear_dr7_gx(int regno, kdbma_t *dr7p)
 {
     if (regno == 0)
         *dr7p = *dr7p & ~0x2;
@@ -219,10 +214,10 @@ kdb_clear_dr7_gx(int regno, kdbma_t *dr7p)
  *
  * Just leave DR0-3 clobbered but remove bits from DR7 to disable wp 
  */
-void kdb_install_watchpoints(void)
+void kdbx_install_watchpoints(void)
 {
     int regno;
-    kdbma_t dr7 = kdb_rd_dbgreg(7);
+    kdbma_t dr7 = kdbx_rd_dbgreg(7);
 
     if ( !kdb_wp_active )
         return;
@@ -261,8 +256,7 @@ void kdb_install_watchpoints(void)
 }
 
 /* clear watchpoint/s. wpnum == -1 to clear all watchpoints */
-void
-kdb_clear_wps(int wpnum)
+void kdbx_clear_wps(int wpnum)
 {
     int i;
 
@@ -294,8 +288,7 @@ kdb_clear_wps(int wpnum)
 }
 
 /* display any watchpoints that are set */
-static void
-kdb_display_wps(void)
+static void kdb_display_wps(void)
 {
     int i;
     for (i=0; i < KDB_MAXWP; i++)
@@ -314,8 +307,7 @@ kdb_display_wps(void)
  *
  *  len should be one of : 1 2 4 8 
  */
-void
-kdb_do_watchpoints(kdbva_t addr, int rw_flag, int len)
+void kdbx_do_watchpoints(kdbva_t addr, int rw_flag, int len)
 {
     if (addr == 0) {
         kdb_display_wps();        /* display set watchpoints */

@@ -31,72 +31,85 @@ static int cursor;
 static char cmds_a[NUM_HIST][K_CMD_BUFSZ];
 #endif
 
-extern int console_set_on_cmdline;
-
-static char cmds_a[K_CMD_BUFSZ];
-
-/* ====> old code at the bottom */
-
-static int kdbx_serial_base = 0x3f8;  /* default to ttyS0 */
-static int kdbx_default_baud = 115200;  /* default to ttyS0 */
 static volatile int kdbxp_gate = 0;
+static char cmds_a[K_CMD_BUFSZ];
+static void kdbx_print_char(char);
+static char kdbx_cmd_getc(void);
+static void kdbx_outc(char ch);
 
-#define XMTRDY          0x20    /* MUK: bit 5 in the LSR */
-#define RCVRDY          0x01    /* MUK: bit 0 in the LSR */
+#ifndef CONFIG_KDBX_FOR_XEN_DOM0
 
-#define DLAB		0x80
+static int kdbx_serial_base = 0x3f8;  /* default to com1/ttyS0 */
+static int kdbx_serial_irq = 4;       /* default for com1 */
+static int kdbx_default_baud = 115200;    /* default to  115200 */
 
-#define TXR             0       /*  Transmit register (WRITE) */
-#define RXR             0       /*  Receive register  (READ)  */
-#define IER             1       /*  Interrupt Enable          */
-#define IIR             2       /*  Interrupt ID              */
-#define FCR             2       /*  FIFO control              */
-#define LCR             3       /*  Line control              */
-#define MCR             4       /*  Modem control             */
-#define LSR             5       /*  Line Status               */
-#define MSR             6       /*  Modem Status              */
-#define DLL             0       /*  Divisor Latch Low         */
-#define DLH             1       /*  Divisor latch High        */
+/* A UART has 8 registers. reg 0 is used for both xmit and receive.
+ *    https://www.activexperts.com/serial-port-component/tutorials/uart/ 
+ */
+#define REG_TXR             0       /*  Transmit register */
+#define REG_RXR             0       /*  Receive register */
+#define REG_IER             1       /*  Interrupt Enable register */
+#define REG_ISR             2       /*  Interrupt status register */
+#define REG_LCR             3       /*  Line control register */
+#define REG_MCR             4       /*  Modem control register */
+#define REG_LSR             5       /*  Line Status register */
+#define REG_MSR             6       /*  Modem Status register */
 
-/* copied from kernel/prink.c */
-struct console_cmdline
-{
-        char    name[8];                        /* Name of the driver       */
-        int     index;                          /* Minor dev. to use        */
-        char    *options;                       /* Options for the driver   */
-};
+#define IER_RXRDY     0x01  /* interrupt when a char is received in RXR */
+#define IER_TXRDY     0x02  /* interrupt when a char is moved out of TXR */
+#define IER_LineError 0x04  /* interrupt when there is line/parity error */
+#define IER_MSI       0x08  /* interrupt when any rs232 line change state */
 
+#define MCR_RTS       0x2
+#define MCR_OUT2      0x8
+
+/* LSR stores general status about the UART */
+#define LSR_RCVRDY   0x01    /* RXR has a character to be read */
+#define LSR_OVRRUN   0x02    /* prev char in RXR over run */
+#define LSR_PARITY   0x04    /* parity error */
+#define LSR_XMTRDY   0x20    /* TXR empty, ready to receive next char */
+
+#define LCR_DLAB	0x80    /* when set, reg 0 and 1 have special meaning */
+#define LCR_DLL         0       /*  Divisor Latch Low         */
+#define LCR_DLH         1       /*  Divisor latch High        */
 
 /*
+ * https://www.activexperts.com/serial-port-component/tutorials/uart/
+ * https://en.wikibooks.org/wiki/Serial_Programming/8250_UART_Programming
+ *
  * TBD: we run in polling mode. IER, interrupt mode, is disabled so in case of
  *      data in, the UART will not interrupt us. When breaking into KDBX, add 
  *      code to disable IER if it's enabled by the tty drivers, then restore it.
  *      Done by serial tty driver.
+ *
+ * REFERENCES: setup_early_printk() and univ8250_console_setup()
  */
-static void kdbx_init_serial_info(char *cmdline)
+static int kdbx_init_serial_info(char *cmdline)
 {
     char *p = strstr(cmdline, "ttyS");
 
     if ( p == NULL ) {
         pr_notice(">>> kdbx: console= in cmdline not set.... \n");
-        return;
+        return -1;
     }
 
     /* parse : console=ttyS0,115200n8 */
     p += 4;
-    if ( *p == '0' )
+    if ( *p == '0' ) {
         kdbx_serial_base = 0x3f8;  /* ttyS0 */
-    else if ( *p == '1' )
+        kdbx_serial_irq = 4;
+    } else if ( *p == '1' ) {
         kdbx_serial_base = 0x2f8;  /* ttyS1 */
-    else {
+        kdbx_serial_irq = 3;
+    } else {
         pr_notice(">>> kdbx: ttyS%c in cmdline not recognized\n", *p);
-        return;
+        return -1;
     }
     p++;
     if ( *p == ',' )
         p++;
     else
-        return;
+        return 0;
 
     if ( strstr(p, "115200") )
         kdbx_default_baud = 115200;
@@ -111,120 +124,335 @@ static void kdbx_init_serial_info(char *cmdline)
     else if ( strstr(p, "3600") )
         kdbx_default_baud = 3600;
     else
-        pr_notice("kdbx: %s baud not recognized\n", p);
+        pr_notice(">>>>>> kdbx: %s baud not recognized. default:%d\n",
+                  p, kdbx_default_baud);
 
-    return;
-
-#if 0
-    while ( (ccp = kdbx_get_console_cmdline(idx++)) ) {
-
-        /* console_cmdline: name:ttyS idx:0 opts:115200n8 */
-        if ( strcmp(ccp->name, "ttyS") == 0 ) {
-
-            if (ccp->index == 1)
-                kdbx_serial_base = 0x2f8;  /* ttyS1 */
-
-            /* will stop at first non-digit */
-            baud = simple_strtol(ccp->options, NULL, 10);
-            if (baud)
-                kdbx_default_baud = baud;
-
-            break;
-        }
-    }
-
-    extern char *boot_command_line;   /* of size COMMAND_LINE_SIZE */
-    char *cp = NULL;
-    int baud = 115200;
-
-    /* need to check for space before after the = sign */
-    if ( (cp = strstr("console=ttyS0", boot_command_line)) )
-        kdbx_serial_base = 0x3f8;
-    else if ( (cp = strstr("console=ttyS1", boot_command_line)) )
-        kdbx_serial_base = 0x2f8;
-    else
-        pr_emerg(">>>>>>>>>>>>> kdbx: serial console not setup\n");
-    
-    if ( cp ) {
-        cp += 10;       /* console=ttyS0,115200n8 */
-        /* need to check for space before/after the comma */
-    }
-
-    return baud;
-#endif
+    return 0;
 }
 
-static char kdbx_console_getc(void)
+/* 
+ * From kdbx_init():
+ *   - early_console is NULL (unless set in grub line)
+ *   - tty_find_polling_driver() returns NULL for both ttyS0 and S1
+ *   - console_drivers == NULL
+ *
+ * pr_notice():  -> vprintk_default() -> vprintk_emit() -> 
+ *                     call_console_drivers() -> console_unlock() just returns
+ *
+ * Without earlyprink: output of pr_notice goes to printk buffer, and when
+ * start_kernel() -> console_init() is called, it is flushed.
+ *
+ * With earlyprintk=ttyS0 : output goes to printk buffer,  and when 
+ *    start_kernel() -> setup_arch() -> parse_early_param(), which is much
+ *    before console_init(), but after kdbx_init(), output is out to ttyS0.
+ *
+ * Order: kdbx_init, then early_printk, then console_init, then way later
+ *        tty setup (tty_find_polling_driver will return null till then).
+ *
+ */
+static void kdbx_init_early_serial(void)
 {
-    while ( (inb(kdbx_serial_base + LSR) & RCVRDY) == 0 )
+    uint divisor, baud;
+    unsigned char c;
+
+    baud = kdbx_default_baud;
+
+    outb(0x3, kdbx_serial_base + REG_LCR);	/* 8n1 */
+    outb(0, kdbx_serial_base + REG_IER);	/* no interrupt */
+    outb(0, kdbx_serial_base + REG_ISR);	/* no fifo */
+    outb(0x3, kdbx_serial_base + REG_MCR);	/* DTR + RTS */
+
+    divisor = 115200 / baud;
+    c = inb(kdbx_serial_base + REG_LCR);
+    outb(c | LCR_DLAB, kdbx_serial_base + REG_LCR);   /* to set divisor */
+    outb(divisor & 0xff, kdbx_serial_base + LCR_DLL);
+    outb((divisor >> 8) & 0xff, kdbx_serial_base + LCR_DLH);
+    outb(c & ~LCR_DLAB, kdbx_serial_base + REG_LCR); /* divisor set is done */
+
+    kdbxp(">>>> kdbx: serial console %s initialized. baud:%d\n", 
+          kdbx_serial_base == 0x3f8 ? "COM1/ttyS0" : "COM2/ttyS1", baud);
+
+    /* so it will show up on other consoles also */
+    // pr_notice("kdbx pr: serial console %s initialized. baud:%d\n", 
+              // kdbx_serial_base == 0x3f8 ? "COM1/ttyS0" : "COM2/ttyS1", baud);
+}
+
+/* called from do_nmi() */
+void kdbx_dump_uart(void)
+{
+    kdbxp(">>>> UART: IER: %x LCR:%x ISR:%x LSR:%x MSR:%x MCR:%x\n",
+          inb(kdbx_serial_base + REG_IER), inb(kdbx_serial_base + REG_LCR),
+          inb(kdbx_serial_base + REG_ISR), inb(kdbx_serial_base + REG_LSR),
+          inb(kdbx_serial_base + REG_MSR), inb(kdbx_serial_base + REG_MCR)); 
+}
+
+void kdbx_init_io(char *cmdline)
+{
+    /* initialize kdbx_serial_base, kdbx_default_baud, .. */
+    if ( kdbx_init_serial_info(cmdline) )
+        return;
+
+    kdbx_init_early_serial();
+
+    /* flush the UART for any input. It buffers even on reset. */
+    /* TBD: DOESN'T SEEM TO HELP: may be reset 8250 ? */
+    while ( (inb(kdbx_serial_base + REG_LSR) & LSR_RCVRDY) )
+        inb(kdbx_serial_base + REG_RXR);
+}
+
+
+uint kdbx_sav_ier, kdbx_sav_mcr;
+
+void kdbx_disable_8250_ints(void)
+{
+    kdbx_sav_ier = inb(kdbx_serial_base + REG_IER);
+    kdbx_sav_mcr = inb(kdbx_serial_base + REG_MCR);
+    outb(0, kdbx_serial_base + REG_IER);    /* disable 8250 interrupts */
+}
+
+void kdbx_enable_8250_ints(void)
+{
+    outb(kdbx_sav_ier, kdbx_serial_base + REG_IER);/* restore 8250 interrupts */
+    outb(kdbx_sav_mcr, kdbx_serial_base + REG_MCR);/* restore mcr. needed?? */
+}
+
+/* ========================================================================= */
+#ifndef CONFIG_SERIAL_8250
+
+/* see https://www.activexperts.com/serial-port-component/tutorials/uart/ */
+irqreturn_t kdbx_serial8250_irq_handler(int irq, void *dev_id)
+{
+    char ch;
+
+    /* swallow any uninteresting characters */
+    while ( (inb(kdbx_serial_base + REG_LSR) & LSR_RCVRDY) )
+        if ( (ch = inb(kdbx_serial_base + REG_RXR)) == 0x1c )
+            break;
+#if 0
+    if ( (inb(kdbx_serial_base + REG_LSR) & LSR_RCVRDY) )
+        ch = inb(kdbx_serial_base + REG_RXR);
+    else {
+        kdbxp(">>>>>> kdbx irq: no LSR, ignoring IRQ:%d\n", irq);
+        goto out;
+    }
+#endif
+    if ( ch == 0x1c ) {
+        kdbx_disable_8250_ints();
+        kdbx_keyboard(get_irq_regs());
+        kdbx_enable_8250_ints();
+    }
+
+    return IRQ_HANDLED;
+}
+
+static void kdbx_setup_serial_irq(void)
+{
+    int ret;
+
+    ret = request_irq(kdbx_serial_irq, kdbx_serial8250_irq_handler, 0, 
+                      "kdbxS0", NULL);
+    if ( ret != 0 )
+        kdbxp(">>>>>> kdbx: request_irq failed. ret:%d\n", ret);
+
+    /* Enable interrupts on the UART so ctrl+\ will work */
+    outb(IER_RXRDY, kdbx_serial_base + REG_IER);
+    outb(MCR_RTS|MCR_OUT2, kdbx_serial_base + REG_MCR);
+
+    kdbxp(">>>>>> kdbx: UART ints enabled\n");
+    kdbx_dump_uart();
+}
+
+static const struct old_serial_port kdbx_old_serinfo[] = {
+        SERIAL_PORT_DFNS /* defined in asm/serial.h */
+};
+
+/* see also: serial8250_probe() -..--> serial8250_config_port()
+ * struct platform_device: include/linux/platform_device.h
+ */
+static int kdbx_register_8250_device(void)
+{
+    int i, sz = 0;
+    struct old_serial_port *op = (struct old_serial_port *)&kdbx_old_serinfo[0];
+
+    for ( i=0; i < ARRAY_SIZE(kdbx_old_serinfo); i++, op++ ) {
+        if ( op->port == kdbx_serial_base )
+            break;
+    }
+    if ( i >= ARRAY_SIZE(kdbx_old_serinfo) ) {
+        kdbxp(">>>>> kdbx: could not find serial_base in old_serial:%x\n",
+              kdbx_serial_base);
+        return -EINVAL;
+    }
+
+    kdbx_serial_irq = op->irq;
+    if ( kdbx_serial_irq != 3 && kdbx_serial_irq != 4 ) {
+        kdbxp(">>>>>kdbx_serial8250_probe: Unexpected IRQ:%d\n", op->irq);
+        return -EINVAL;
+    }
+    sz = 8 << op->iomem_reg_shift;    /* serial8250_port_size() */
+    if ( sz == 0 ) {
+        kdbxp(">>>> kdbx_serial8250_probe: ERROR region size is 0?\n");
+        return -EINVAL;
+    }
+
+    kdbxp(">>>>>>kdbx register serial: iobase:%x irq:%x regsize:%d\n",
+          kdbx_serial_base, kdbx_serial_irq, sz);
+
+    if ( !request_region(kdbx_serial_base, sz, "serial") ) {
+        kdbxp(">>>>> kdbx_serial8250_probe: unable to req region\n");
+        return -EBUSY;
+    }
+
+    return 0;
+}
+
+static int kdbx_serial8250_probe(struct platform_device *dev)
+{
+    kdbxp(">>>> KDBX: kdbx_serial8250_probe. ret 0\n");
+    return 0;
+}
+static int kdbx_serial8250_remove(struct platform_device *dev)
+{
+    kdbxp(">>>> KDBX: refusing to remove 8250 driver\n");
+    return 0;
+}
+
+static struct platform_device *kdbx_serial8250_isa_devs;
+
+static struct platform_driver kdbx_serial8250_isa_driver = {
+        .probe          = kdbx_serial8250_probe,
+        .remove         = kdbx_serial8250_remove,
+        .driver         = {
+                .name   = "serial8250",
+                .owner  = THIS_MODULE,
+        },
+};
+
+/* register device driver for uart device on the bus */
+static int __init kdbx_serial8250_init(void)
+{
+        int ret = 0;
+
+        kdbx_serial8250_isa_devs = platform_device_alloc("serial8250",
+                                                         PLAT8250_DEV_LEGACY);
+        if (!kdbx_serial8250_isa_devs) {
+                kdbxp(">>>>> kdbx_serial8250_init dev alloc failed\n");
+                return -ENOMEM;
+        }
+        ret = platform_device_add(kdbx_serial8250_isa_devs);
+        if (ret) {
+            kdbxp(">>>>> kdbx_serial8250_init: dev add failed. ret:%d\n", ret);
+            platform_device_put(kdbx_serial8250_isa_devs);
+            return ret;
+        }
+
+        if ( (ret = kdbx_register_8250_device()) ) {
+            platform_device_put(kdbx_serial8250_isa_devs);
+            return ret;
+        }
+        ret = platform_driver_register(&kdbx_serial8250_isa_driver);
+        if (ret) {
+            platform_device_del(kdbx_serial8250_isa_devs);
+            platform_device_put(kdbx_serial8250_isa_devs);
+        }
+
+        kdbx_setup_serial_irq();
+
+        return ret;
+}
+
+module_init(kdbx_serial8250_init);
+
+
+static void kdbx_console_write(struct console *co, const char *s, uint num)
+{
+        while (num--)
+            kdbx_print_char(*s++);
+}
+
+static struct console kdbx_console = {
+        .name           = "kdbxS",
+        .write          = kdbx_console_write,
+        .flags          = CON_PRINTBUFFER | CON_ANYTIME | CON_ENABLED,
+};
+
+/* add kdbx console so that all udev and init process who write to console
+ * can have their output on xterm */
+static int __init kdbx_console_init(void)
+{
+        register_console(&kdbx_console);
+        return 0;
+}
+console_initcall(kdbx_console_init);
+#endif /* ifndef CONFIG_SERIAL_8250 */
+
+static char kdbx_cmd_getc(void)
+{
+    while ( (inb(kdbx_serial_base + REG_LSR) & LSR_RCVRDY) == 0 )
         cpu_relax();
 
-    return (inb(kdbx_serial_base + RXR));
+    return (inb(kdbx_serial_base + REG_RXR));
 }
 
 static void kdbx_outc(char ch)
 {
-    while ( (inb(kdbx_serial_base + LSR) & XMTRDY) == 0 )
+    while ( (inb(kdbx_serial_base + REG_LSR) & LSR_XMTRDY) == 0 )
         cpu_relax();
 
-    outb(ch, kdbx_serial_base + TXR);
+    outb(ch, kdbx_serial_base + REG_TXR);
 }
 
-static void kdbx_console_putc(char ch)
+#else   /* CONFIG_KDBX_FOR_XEN_DOM0 */
+
+/* we are running as dom0 on xen, and don't need to do anything */
+void kdbx_init_io(char *cmdline)
+{
+}
+
+static char kdbx_cmd_getc(void)
+{
+    char ch;
+
+    /* can't call console function because when key typed, xen will inject 
+     * virq into dom0 and the handler, hvc_poll() will get called and 
+     * inject key into tty */
+    while (dom0_read_console(0, &ch, 1) <= 0 )
+        cpu_relax();
+
+    return ch;
+}
+
+static void kdbx_outc(char ch)
+{
+    // printk(KERN_EMERG "%c", ch);
+    dom0_write_console(0, &ch, 1);
+}
+
+#endif /* CONFIG_KDBX_FOR_XEN_DOM0 */
+
+
+static void kdbx_print_char(char ch)
 {
     if ( ch == '\n' )
         kdbx_outc('\r');
 
     kdbx_outc(ch);
 }
-
-/* 
- * Code from early_serial_console.c, and early_printk.c.
- * Alternately, we could use cmdline_find_option() to find console= value,
- * or go thru console_cmdline[] to see what has been set in cmdline.
- *
- * https://en.wikibooks.org/wiki/Serial_Programming/8250_UART_Programming
- */
-void kdbx_init_console(char *cmdline)
-{
-    uint divisor, baud;
-    unsigned char c;
-
-    /* initialize kdbx_serial_base, kdbx_default_baud, .. */
-    kdbx_init_serial_info(cmdline); 
-    baud = kdbx_default_baud;
-
-    outb(0x3, kdbx_serial_base + LCR);	/* 8n1 */
-    outb(0, kdbx_serial_base + IER);	/* no interrupt */
-    outb(0, kdbx_serial_base + FCR);	/* no fifo */
-    outb(0x3, kdbx_serial_base + MCR);	/* DTR + RTS */
-
-    divisor = 115200 / baud;
-    c = inb(kdbx_serial_base + LCR);
-    outb(c | DLAB, kdbx_serial_base + LCR);
-    outb(divisor & 0xff, kdbx_serial_base + DLL);
-    outb((divisor >> 8) & 0xff, kdbx_serial_base + DLH);
-    outb(c & ~DLAB, kdbx_serial_base + LCR);
-
-    kdbxp("kdbx: serial console %s initialized. baud:%d\n", 
-          kdbx_serial_base == 0x3f8 ? "COM1/ttyS0" : "COM2/ttyS1", baud);
-    /* so it will show up in dmesg also */
-    pr_notice("kdbx pr: serial console %s initialized. baud:%d\n", 
-              kdbx_serial_base == 0x3f8 ? "COM1/ttyS0" : "COM2/ttyS1", baud);
-}
-
 static int kdb_key_valid(int key)
 {
     /* note: isspace() is more than ' ', hence we don't use it here */
     if (isalnum(key) || key == ' ' || key == K_BACKSPACE || key == '\n' ||
-        key == '?' || key == K_UNDERSCORE || key == '=' || key == '!')
-            return 1;
+        key == '?' || key == K_UNDERSCORE || key == '=' || key == '!' ||
+        key == '.' )
+    {
+        return 1;
+    }
     return 0;
 }
 
 /* display kdb prompt and read command from the console 
  * RETURNS: a '\n' terminated command buffer */
-char *kdb_get_cmdline(char *prompt)
+char *kdbx_get_input(char *prompt)
 {
     #define K_BELL     0x7
     #define K_CTRL_C   0x3
@@ -240,17 +468,17 @@ char *kdb_get_cmdline(char *prompt)
 
     i = 0;
     do {
-        key = kdbx_console_getc();
+        key = kdbx_cmd_getc();
         if (key == '\r') 
             key = '\n';
         if (key == K_BACKSPACE1) 
             key = K_BACKSPACE;
 
         if (key == K_CTRL_C || (i==K_CMD_MAXI && key != '\n')) {
-            kdbx_console_putc('\n');
+            kdbx_print_char('\n');
             if (i >= K_CMD_MAXI) {
                 kdbxp("KDB: cmd buffer overflow\n");
-                kdbx_console_putc(K_BELL);
+                kdbx_print_char(K_BELL);
             }
             memset(cmds_a, 0, K_CMD_BUFSZ);
             i = 0;
@@ -258,22 +486,22 @@ char *kdb_get_cmdline(char *prompt)
             continue;
         }
         if (!kdb_key_valid(key)) {
-            // kdbx_console_putc(K_BELL);
+            // kdbx_print_char(K_BELL);
             continue;
         }
         if (key == K_BACKSPACE) {
             if (i==0) {
-                kdbx_console_putc(K_BELL);
+                kdbx_print_char(K_BELL);
                 continue;
             } else {
                 cmds_a[--i] = '\0';
-                kdbx_console_putc(K_BACKSPACE);
-                kdbx_console_putc(' ');        /* erase character */
+                kdbx_print_char(K_BACKSPACE);
+                kdbx_print_char(' ');        /* erase character */
             }
         } else
             cmds_a[i++] = key;
 
-        kdbx_console_putc(key);
+        kdbx_print_char(key);
 
     } while (key != '\n');
 
@@ -282,421 +510,100 @@ char *kdb_get_cmdline(char *prompt)
     return cmds_a;
 }
 
+int kdbx_kernel_printk(char *fmt, va_list args)
+{
+    char buf[1024];     /* if you make this static, cmpxchg before vsnprintf */
+    int num, i=0;
+
+    num = vscnprintf(buf, sizeof(buf), fmt, args);
+    if (printk_get_level(buf))
+        i = 1;
+
+    while ((__cmpxchg(&kdbxp_gate, 0,1, sizeof(kdbxp_gate)) != 0) && i++ < 3000)
+        mdelay(2);
+
+    for (; i < num; i++)
+        kdbx_print_char(buf[i]);
+
+    kdbxp_gate = 0;
+
+    return num;
+}
+
 /*
  * printk takes a lock, an NMI could come in after that, and another cpu may 
  * spin. also, the console lock is forced unlock, so panic is been seen on 
  * 8 way. hence, no printk() calls.
  */
-void kdbxp(const char *fmt, ...)
+void kdbxp(char *fmt, ...)
 {
-    char buf[256];      /* if you make this static, cmpxchg before vsnprintf */
     va_list args;
-    char *p;
-    int i=0;
 
     va_start(args, fmt);
-    (void)vsnprintf(buf, sizeof(buf), fmt, args);
+    kdbx_kernel_printk(fmt, args);
+    // (void)vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-
-    while ((__cmpxchg(&kdbxp_gate, 0,1, sizeof(kdbxp_gate)) != 0) && i++ < 3000)
-        mdelay(2);
-
-    for (p=buf; *p != '\0'; p++)
-        kdbx_console_putc(*p);
-
-    kdbxp_gate = 0;
 }
+
+/* ======================================================================== */
+#ifdef KDBX_CONFIG_SWITCH_TO_TTY
 
 /*
- * copy/read machine memory. 
- * RETURNS: number of bytes copied 
- */
-int kdb_read_mmem(kdbma_t maddr, kdbbyt_t *dbuf, int len)
+  1. in kdbx/Makefile add:
+     KBUILD_CPPFLAGS +=-DKDBX_CONFIG_SWITCH_TO_TTY
+
+  2. Add a call to kdbx_switch_to_tty() at the very end in serial8250_init()
+     in serial/8250/8250_core.c
+*/
+
+static int kdbx_tty_line;
+static struct tty_driver *kdbx_tty_driver;
+
+void kdbx_switch_to_tty(void)
 {
-    ulong orig = len;
-
-    while (len > 0) {
-        ulong pagecnt = min_t(long, PAGE_SIZE - (maddr & ~PAGE_MASK), len);
-        struct page *pg = pfn_to_page(maddr >> PAGE_SHIFT);
-        char *va = kmap(pg);
-
-        if ( pg == NULL || va == NULL ) {
-            kdbxp("kdbx: unable to kmap maddr:%016lx\n", maddr);
-            break;
-        }
-
-        va = va + (maddr & (PAGE_SIZE-1));        /* add page offset */
-        memcpy(dbuf, (void *)va, pagecnt);
-
-        KDBGP1("maddr:%x va:%p len:%x pagecnt:%x\n", maddr, va, len, pagecnt );
-        kunmap(pg);
-
-        len = len  - pagecnt;
-        maddr += pagecnt;
-        dbuf += pagecnt;
-    }
-
-    return orig - len;
-}
-
-static int kdb_early_rmem(kdbva_t saddr, kdbbyt_t *dbuf, int len)
-{
-    return (len - __copy_from_user_inatomic((void *)dbuf, (void *)saddr, len));
-}
-
-/* RETURNS: number of bytes written */
-static int kdb_early_wmem(kdbva_t daddr, kdbbyt_t *sbuf, int len)
-{
-    return (len - __copy_to_user_inatomic((void *)daddr, sbuf, len));
-}
-
-/* given a pfn, map the page and return the pgd/pud/pmd/pte entry at given 
- * offset.
- * returns: 0 if failed (or entry could be 0 also) */
-static ulong kdb_lookup_pt_entry(ulong gfn, int idx, struct kvm_vcpu *vp)
-{
-    ulong rval;
-    ulong pfn = kdb_p2m(gfn, vp);
-    struct page *pg = pfn_valid(pfn) ? pfn_to_page(pfn) : NULL;
-    char *va = pg ? kmap(pg) : NULL;
-
-    KDBGP1("lookup e: gfn:%lx pfn:%lx idx:%x va:%p\n", gfn, pfn, idx, va);
-    if ( !pfn_valid(pfn) ) {
-        kdbxp("kdb_lookup_pt_entry: pfn:%lx invalid. gfn:%lx vp:%p\n", pfn,
-              gfn, vp);
-        return 0;
-    }
-
-    if ( pg == NULL || va == NULL ) {
-        kdbxp("lookup: Unable to map pfn: %lx pg:%p\n", pfn, pg);
-        return 0;
-    }
-
-    va += idx * 8;
-    rval = *(ulong *)va;
-    kunmap(pg);
-    KDBGP1("lookup e: return entry:%lx\n", rval);
-
-    return rval;
-}
-
-/* given a cr3 gfn, walk the pt pointed by the cr3 gfn (could be guest),
- * and return pfn/mfn for the pte gfn */
-ulong kdb_pt_pfn(ulong addr, ulong cr3gfn, struct kvm_vcpu *vp, int *levelp)
-{
-    ulong gfn, entry;
-
-    *levelp = PG_LEVEL_NONE;
-
-    KDBGP1("ptepfn: addr:%lx cr3gfn:%lx vp:%p\n", addr, cr3gfn, vp);
-    entry = kdb_lookup_pt_entry(cr3gfn, pgd_index(addr), vp);
-    if ( entry == 0 ) {
-        kdbxp("pgd not present. cr3gfn:%lx pgdidx:%x vp:%p\n",
-              cr3gfn, pgd_index(addr), vp);
-
-        return (ulong)-1;
-    }
-
-    *levelp = PG_LEVEL_1G;
-    gfn = (entry & PTE_PFN_MASK) >> PAGE_SHIFT;
-    entry = kdb_lookup_pt_entry(gfn, pud_index(addr), vp);
-    if ( entry == 0 ) {
-        kdbxp("Failed to lookup pud entry. gfn:%lx pudidx:%x vp:%p\n",
-              gfn, pud_index(addr), vp);
-
-        return (ulong)-1;
-    }
-    if ( !pud_present((pud_t){.pud = entry}) ) {
-        kdbxp("pud is not present. entry:%lx\n", entry);
-        return (ulong)-1;
-    }
-    if ( pud_large((pud_t){.pud = entry}) )
-        goto out;
-
-    *levelp = PG_LEVEL_2M;
-    gfn = (entry & PTE_PFN_MASK) >> PAGE_SHIFT;
-    entry = kdb_lookup_pt_entry(gfn, pmd_index(addr), vp);
-    if ( entry == 0 ) {
-        kdbxp("Failed to lookup pmd entry. gfn:%lx pmdidx:%x vp:%p\n",
-              gfn, pmd_index(addr), vp);
-
-        return (ulong)-1;
-    }
-    if ( !pmd_present((pmd_t){.pmd = entry}) ) {
-        kdbxp("pmd is not present. entry:%lx\n", entry);
-        return (ulong)-1;
-    }
-    if ( pmd_large((pmd_t){.pmd = entry}) )
-        goto out;
-
-    *levelp = PG_LEVEL_4K;
-    gfn = (entry & PTE_PFN_MASK) >> PAGE_SHIFT;
-    entry = kdb_lookup_pt_entry(gfn, pte_index(addr), vp);
-    if ( entry == 0 ) {
-        kdbxp("Failed to lookup pte entry. gfn:%lx pteidx:%x vp:%p\n",
-              gfn, pte_index(addr), vp);
-
-        return (ulong)-1;
-    }
-    if ( !pte_present((pte_t){.pte = entry}) ) {
-        kdbxp("pte is not present. entry:%lx\n", entry);
-        return (ulong)-1;
-    }
-
-out:
-    gfn = (entry & PTE_PFN_MASK) >> PAGE_SHIFT;
-    return kdb_p2m(gfn, vp);
-}
-
-/* RETURNS: number of bytes copied */
-static int kdb_rw_cr3_mem(kdbva_t addr, kdbbyt_t *buf, int len,
-                          struct kvm_vcpu *vp, int toaddr)
-{
-    ulong cr3gfn;
-    int level, orig_len = len;
-
-    if ( vp ) {
-        cr3gfn = kdb_get_hvm_field(vp, GUEST_CR3) >> PAGE_SHIFT;
-    } else {
-        // cr3gfn = (__pa(init_mm.pgd->pgd)) >> PAGE_SHIFT;
-        kdbxp("kdb_rw_cr3_mem: guest only, vp must be specified.\n");
-        return 0;
-    }
-
-    KDBGP1("rw-cr3mem: addr:%lx vp:%p len:%d to:%d cr3gfn:%lx\n", addr, vp, 
-           len, toaddr, cr3gfn);
-
-    while (len > 0) {
-        ulong pagecnt = min_t(long, PAGE_SIZE - (addr & ~PAGE_MASK), len);
-        ulong pfn = kdb_pt_pfn(addr, cr3gfn, vp, &level);
-        struct page *pg = pfn_valid(pfn) ? pfn_to_page(pfn) : NULL;
-        char *va = pg ? kmap(pg) : NULL;
-
-        if ( !pfn_valid(pfn) ) {
-            kdbxp("kdb_rw_cr3_mem: pfn:%lx invalid\n", pfn);
-            break;
-        }
-        if ( pg == NULL || va == NULL ) {
-            kdbxp("kdbx: unable to kmap addr:%016lx pfn:%lx\n", addr, pfn);
-            break;
-        }
-        if ( level == PG_LEVEL_1G ) {
-            kdbxp("FIXME: 1G Page.. cr3gfn:%lx addr:%lx\n", cr3gfn, addr);
-            break;
-        } else if ( level == PG_LEVEL_2M )
-            va = va + (addr & (PMD_PAGE_SIZE - 1));       /* add page offset */
-        else if ( level == PG_LEVEL_4K )
-            va = va + (addr & (PAGE_SIZE - 1));           /* add page offset */
-        else {
-            kdbxp("Unexpected page level: %d cr3gfn:%lx addr:%lx\n", level, 
-                  cr3gfn, addr);
-            break;
-        }
-
-        if ( toaddr )
-            memcpy(va, buf, pagecnt);
-        else
-            memcpy(buf, va, pagecnt);
-
-        KDBGP1("addr:%lx va:%p len:%x pagecnt:%x\n", addr, va, len, pagecnt );
-        kunmap(pg);
-
-        len = len  - pagecnt;
-        addr += pagecnt;
-        buf += pagecnt;
-    }
-
-    return orig_len - len;
-}
-
-/* RETURNS: number of bytes written */
-/*
- * copy/read guest memory
- * RETURNS: number of bytes copied 
- */
-int kdb_read_mem(kdbva_t saddr, kdbbyt_t *dbuf, int len, struct kvm_vcpu *vp)
-{
-    KDBGP2("read mem: saddr:%lx (int)src:%x len:%d vp:%p\n", saddr,
-           *(uint *)dbuf, len, vp);
-
-    if ( max_pfn_mapped == 0 )
-        return kdb_early_rmem(saddr, dbuf, len);
-
-    if ( vp )
-        return kdb_rw_cr3_mem(saddr, dbuf, len, vp, 0);
-    else if ( probe_kernel_read((void *)dbuf, (void *)saddr, len) == -EFAULT )
-        return 0;
-
-    return len;
-}
-
-/*
- * kernel text is protected, so can't use probe_kernel_write.
- * RETURNS: number of bytes written
- */
-int kdb_write_protected(kdbva_t daddr, kdbbyt_t *sbuf, int len )
-{
-    KDBGP2("write mem: addr:%lx (int)src:%lx len:%d\n", daddr,
-           *(uint *)sbuf, len);
-    text_poke((void *)daddr, (const void *)sbuf, len);
-
-    return (len);
-}
-
-/*
- * write guest or host memory. if vp, then guest, else host.
- * RETURNS: number of bytes written
- */
-int kdb_write_mem(kdbva_t daddr, kdbbyt_t *sbuf, int len, struct kvm_vcpu *vp)
-{
-    ulong rc;
-
-    KDBGP2("write mem: addr:%lx (int)src:%lx len:%d vp:%p\n", daddr,
-           *(uint *)sbuf, len, vp);
-
-    /* if we are early during boot before init_mem_mapping() */
-    if ( max_pfn_mapped == 0 )
-        return kdb_early_wmem(daddr, sbuf, len);
-
-
-    if ( vp == NULL ) {          /* host memory */
-        if ( __kernel_text_address(daddr) )
-            return kdb_write_protected(daddr, sbuf, len);
-
-        rc = probe_kernel_write((void *)daddr, (void *)sbuf, len);
-        if (rc == -EFAULT)
-            kdbxp("kdbx memwr -EFAULT: addr:%lx sz:%d\n", daddr, len);
-
-    } else {
-        /* guest memory */
-        return kdb_rw_cr3_mem(daddr, sbuf, len, vp, 1);
-    }
-
-    KDBGP2("write mem rc:%d\n", rc);
-
-    return (len - rc);
-}
-
-/* ------------ OLD CODE ---------------------------------------------- */
-#if 0
-
-/* when called from main.c:kdbx_init(), neither tty nor console are initialized
- * and both print null. when breaking in upon boot, both are there. 
- * NOTE: early_printk is not initialzed without the early printk grub param.
- */
-void kdbx_init_console(void)
-{
-    struct console *cons;
-
     kdbx_tty_driver = tty_find_polling_driver("ttyS0", &kdbx_tty_line);
     if (!kdbx_tty_driver) {
-        printk(KERN_EMERG "kdbx: unable to find polling driver %s\n",
-               kdbx_option);
+        kdbxp(">>>>> kdbx: unable to find polling driver \n");
+        printk(KERN_EMERG "kdbx: unable to find polling driver \n");
         return;
     }
 
-    cons = console_drivers;
-    while (cons) {
-        int idx;
-
-        if (cons->device && cons->device(cons, &idx) == kdbx_tty_driver && 
-            idx == kdbx_tty_line) 
-        {
-            break;
-        }
-        cons = cons->next;
-    }
-    if ( cons )
-        kdb_console = cons;
-    else 
-        printk(KERN_EMERG "kdbx: unable to find console\n");
-
-    printk(KERN_EMERG "kdbxinitc: early_cons:%p\n", early_console);
-    printk(KERN_EMERG "kdbxtty:%p console:%p\n", kdbx_tty_driver, kdb_console);
+    kdbxp(">> kdbx: switch to tty driver:%p\n", kdbx_tty_driver);
+    pr_notice(">>>>>>kdbx: switch to tty driver:%p\n", kdbx_tty_driver);
 }
 
-static char kdbx_console_getc(void)
+static char kdbx_cmd_getc(void)
 {
-    char c;
+    char c = 0;
 
-    if (!kdbx_tty_driver)
-        return -1;
+    if ( likely(kdbx_tty_driver) ) {
+        while ( c == 0 ) {
+            c = kdbx_tty_driver->ops->poll_get_char(kdbx_tty_driver, 
+                                                    kdbx_tty_line);
+            if ( c == 0 )
+                cpu_relax();
+        }
+        return c;
+    }
 
-    for (c = 0; ; ) {
-        c = kdbx_tty_driver->ops->poll_get_char(kdbx_tty_driver, kdbx_tty_line);
-        if ( c )
-            break;
+    while ( (inb(kdbx_serial_base + REG_LSR) & LSR_RCVRDY) == 0 )
         cpu_relax();
-    }
-    return c;
+
+    return (inb(kdbx_serial_base + REG_RXR));
 }
 
-static void kdbx_console_putc(char c)
+static void kdbx_outc(char ch)
 {
-    if (!kdbx_tty_driver)
-        return;
-
-     kdbx_tty_driver->ops->poll_put_char(kdbx_tty_driver, kdbx_tty_line, c);
-}
-
-// struct tty_driver *kdbx_tty_driver;
-// static struct console *kdb_console;
-// static int kdbx_tty_line;
-
-
-    struct console *cons;
-pr_emerg("MUK: check for consoles\n");
-for_each_console(cons) {
-    int idx;
-   pr_emerg("MUK: kdbx init: cons->name:%s\n", cons->name);
-   if (cons->device) 
-         cons->device(cons, &idx);
-   pr_emerg("MUK: cons->name:%s idx:%d r:%p w:%p\n", cons->name, idx,
-            cons->read, cons->write);
-
-}
-
-    kdbx_tty_driver = tty_find_polling_driver("ttyS0", &kdbx_tty_line);
-
-    if (!kdbx_tty_driver) {
-        printk(KERN_EMERG "kdbx: unable to find polling driver %s\n",
-               kdbx_option);
+    if ( likely(kdbx_tty_driver) ) {
+        kdbx_tty_driver->ops->poll_put_char(kdbx_tty_driver, kdbx_tty_line, ch);
         return;
     }
 
-struct tty_driver *driver = kdbx_tty_driver;
-        struct uart_driver *drv = driver->driver_state;
-        struct uart_state *state = drv->state + line;
-        struct uart_port *port;
+    while ( (inb(kdbx_serial_base + REG_LSR) & LSR_XMTRDY) == 0 )
+        cpu_relax();
 
-    pr_emerg("MUK: found tty driver.. \n");
-        if (!state || !state->uart_port)
-                return ;
-
-        port = state->uart_port;
-        pr_emerg("port:%p  port->ops->poll_get_char:%p\n", port,
-                 port->ops->poll_get_char);
-
-static int kdbx_mod_init(void)
-{
-    static int kdbx_tty_line;
-    struct tty_driver *kdbx_tty_driver;
-
-    kdbxp(">>>>>>>>>> kdbx_init()\n");
-
-    kdbx_tty_driver = tty_find_polling_driver("ttyS0", &kdbx_tty_line);
-    if (!kdbx_tty_driver) {
-        kdbxp(">>>>>>>>>>>>>> unable to find tty_driver\n");
-        return 0;
-    } 
-    return 0;
+    outb(ch, kdbx_serial_base + REG_TXR);
 }
 
-static void kdbx_mod_exit(void)
-{
-}
+#endif /* KDBX_CONFIG_SWITCH_TO_TTY */
 
-module_init(kdbx_mod_init)
-module_exit(kdbx_mod_exit)
-
-#endif

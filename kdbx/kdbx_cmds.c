@@ -35,6 +35,9 @@
 #define KDB_MAXARGC 16                  /* max args in a kdb command */
 #define KDB_MAXBTP  8                   /* max display args in btp */
 
+static kdbtab_t *kdb_cmd_tbl;
+static char kdb_prompt[32];
+
 /* condition is: 'r6 == 0x123f' or '0xffffffff82800000 != deadbeef'  */
 struct kdb_bpcond {
     kdbbyt_t bp_cond_status;       /* 0 == off, 1 == register, 2 == memory */
@@ -121,22 +124,22 @@ static int kdb_parse_cmdline(char *lp, const char **argv)
     return i;
 }
 
-void kdb_clear_prev_cmd()             /* so previous command is not repeated */
+void kdbx_clear_prev_cmd()             /* so previous command is not repeated */
 {
     tbp = NULL;
 }
 
-void kdb_do_cmds(struct pt_regs *regs)
+void kdbx_do_cmds(struct pt_regs *regs)
 {
     char *cmdlinep;
     const char *argv[KDB_MAXARGC];
     int argc = 0, curcpu = smp_processor_id();
-    kdb_cpu_cmd_t result = KDB_CPU_MAIN_KDB;
+    kdbx_cpu_cmd_t result = KDB_CPU_MAIN_KDB;
 
     snprintf(kdb_prompt, sizeof(kdb_prompt), "[%d]kdbx> ", curcpu);
 
     while (result == KDB_CPU_MAIN_KDB) {
-        cmdlinep = kdb_get_cmdline(kdb_prompt);
+        cmdlinep = kdbx_get_input(kdb_prompt);
         if (*cmdlinep == '\n') {
             if (tbp==NULL || tbp->kdb_cmd_func==NULL)
                 continue;
@@ -149,7 +152,7 @@ void kdb_do_cmds(struct pt_regs *regs)
                     break;
             }
         }
-        if (kdb_sys_crash && tbp->kdb_cmd_func && !tbp->kdb_cmd_crash_avail) {
+        if (kdbx_sys_crash && tbp->kdb_cmd_func && !tbp->kdb_cmd_crash_avail) {
             kdbxp("cmd not available in fatal/crashed state....\n");
             continue;
         }
@@ -160,7 +163,7 @@ void kdb_do_cmds(struct pt_regs *regs)
         } else
             kdbxp("kdb: Unknown cmd: %s\n", cmdlinep);
     }
-    kdb_cpu_cmd[curcpu] = result;
+    kdbx_cpu_cmd[curcpu] = result;
 }
 
 /* ===================== Util functions  ==================================== */
@@ -168,23 +171,101 @@ void kdb_do_cmds(struct pt_regs *regs)
 static int kdb_addr_is_valid(ulong addr, pid_t guest_pid)
 {
     if ( guest_pid )
-        return kdb_is_addr_guest_text(addr, guest_pid);
+        return kdbx_is_addr_guest_text(addr, guest_pid);
 
     return __kernel_text_address(addr);
 }
 
-/* Given a symbol, find it's address */
-kdbva_t kdb_sym2addr(const char *p, pid_t gpid)
+#define KDBX_SYM_IDX_MAX 16
+static int kdbx_sym_idx;
+struct kdbx_sym_info {
+    char sym_name_found[KSYM_NAME_LEN+1]; /* not sure if includes null char */
+    ulong sym_addr;
+};
+static struct kdbx_sym_info kdbx_sym_infoa[KDBX_SYM_IDX_MAX];
+
+/* ret num of chars before "." or \0 if no dot found */
+static int kdbx_sym_find_dot(char *name)
 {
-    kdbva_t addr;
+    int len;
 
-    KDBGP1("sym2addr: p:%s\n", p);
+    /* some symbols begin with dot, like .slowpath, .LC17 etc.. allow that */
+    for (len=0; *name; name++, len++)
+        if (*name == '.' && len)
+            break;
+
+    return len;
+}
+
+/* Note: static symbols will occur multiple times, eg. x2apic_send_IPI. 
+ *  Also: part of a function could be inlined too.. eg:
+ *    console_trylock and console_trylock.part.17
+ *
+ * Other examples:
+ *    mutex_lock.isra.19
+ *    cpumask_weight.constprop.26
+ */
+static int kdbx_sym_callback(void *data, const char *name,
+                             struct module *mod, unsigned long addr)
+{
+    void *dst;
+    char *symname = data;  /* name for which we are looking for address */
+    int dotlen = kdbx_sym_find_dot((char *)name);
+
+    if (dotlen == 0 || strncmp(symname, name, dotlen) != 0) 
+        return 0;
+
+    /* we were looking for console_trylock.part.17, but found console_trylock */
+    if ( strlen(name) < strlen(symname) )
+        return 0;
+
+    if ( kdbx_sym_idx >= KDBX_SYM_IDX_MAX ) {
+        kdbxp("kdbx_sym_idx overflow : %d\n", kdbx_sym_idx);
+        return -1;   /* iteration will stop */
+    }
+
+    /* save full name including .constprop/.isra etc.. */
+    dst = kdbx_sym_infoa[kdbx_sym_idx].sym_name_found;
+    memcpy(dst, name, strlen(name)+1);
+    kdbx_sym_infoa[kdbx_sym_idx++].sym_addr = addr;
+
+    return 0;
+}
+
+/* Given a symbol, find it's address. NOT smp safe, call one cpu at a time */
+kdbva_t kdb_sym2addr(char *p, pid_t gpid)
+{
+    kdbva_t addr = 0;
+
+    KDBGP1("sym2addr: p:%s gpid:%d\n", p, gpid);
     if ( gpid )
-        addr = kdb_guest_sym2addr((char *)p, gpid);
-    else
-        addr = kallsyms_lookup_name(p);
-    KDBGP1("sym2addr: exit: addr returned:0x%lx\n", addr);
+        addr = kdbx_guest_sym2addr((char *)p, gpid);
+    else {
+        kdbx_sym_idx = 0;
+        memset(kdbx_sym_infoa, 0, sizeof(kdbx_sym_infoa));
+        kallsyms_on_each_symbol(kdbx_sym_callback, p);
 
+        if ( kdbx_sym_idx == 0 )
+            addr = 0;
+        else if ( kdbx_sym_idx == 1 )
+            addr = kdbx_sym_infoa[0].sym_addr;
+        else {
+            int i;
+
+            addr = 0;
+            kdbxp("  Multiple addresses for symbol: %s\n", p);
+            for (i=0; i< kdbx_sym_idx; i++) {
+                kdbxp("  %lx %s\n", kdbx_sym_infoa[i].sym_addr,
+                      kdbx_sym_infoa[i].sym_name_found);
+                
+                /* if there is exact match, use that. print above warning too?*/
+                if (strcmp(p, kdbx_sym_infoa[i].sym_name_found) == 0)
+                    addr = kdbx_sym_infoa[i].sym_addr;
+            }
+            kdbxp("\n");
+        }
+    }
+    KDBGP1("sym2addr: exit: addr returned:0x%lx\n", addr);
     return addr;
 }
 
@@ -253,7 +334,7 @@ static int kdb_str2addr(const char *strp, kdbva_t *addrp, pid_t gpid)
     KDBGP2("str2addr: str:%s gpid:%d\n", strp, gpid);
     addr = (kdbva_t)simple_strtoul(strp, &endp, 16);   /* handles leading 0x */
     if ( endp != strp+strlen(strp) )    /* failed, check if symbol str */
-        if ( !(addr = kdb_sym2addr(strp, gpid)) )
+        if ( !(addr = kdb_sym2addr((char *)strp, gpid)) )
             return 0;
 
     *addrp = addr;
@@ -370,7 +451,7 @@ static struct kvm_vcpu *kdb_str2vcpu(const char *arg, int perr)
 }
 
 /* return vcpu ptr for given pid if it's guest pid, else NULL */
-struct kvm_vcpu *kdb_pid_to_vcpu(pid_t pid, int pr_err)
+struct kvm_vcpu *kdbx_pid_to_vcpu(pid_t pid, int pr_err)
 {
     int i;
     struct list_head *lp;
@@ -391,7 +472,7 @@ struct kvm_vcpu *kdb_pid_to_vcpu(pid_t pid, int pr_err)
         }
     }
     if (pr_err)
-        kdbxp("Invalid pid %d\n", pid);
+        kdbxp("pid_to_vcpu: Invalid pid %d\n", pid);
 
     return NULL;
 }
@@ -408,11 +489,33 @@ static struct kvm_vcpu *kdb_pidvcpustr2vcpu(const char *arg, int pr_err)
         return vp;
 
     if ( kdb_str2pid(arg, &pid, pr_err) )
-        return kdb_pid_to_vcpu(pid, pr_err);
+        return kdbx_pid_to_vcpu(pid, pr_err);
 
     return NULL;
 }
 
+static struct kvm *kdbx_str2skvm(const char *kpstr, int perror)
+{
+    extern struct list_head vm_list;
+    ulong addr;
+    struct list_head *lp;
+
+    if (kdb_str2ulong(kpstr, &addr) == 0) {
+        if (perror)
+            kdbxp("Unable to convert %s to ulong\n", kpstr);
+        return NULL;
+    }
+    list_for_each(lp, &vm_list) {
+        struct kvm *kp = list_entry(lp, struct kvm, vm_list); /* container of*/
+
+        if ((ulong)kp == addr)
+            return kp;
+    }
+    if (perror)
+        kdbxp("Invalid skvm ptr:%lx\n", addr);
+
+    return NULL;
+}
 #if 0
 vp->kvm == struct kvm *
 static struct kvm *kdb_vcpu2skvm(struct kvm_vcpu *in_vp, int pr_err)
@@ -444,7 +547,7 @@ static struct kvm *kdb_vcpu2skvm(struct kvm_vcpu *in_vp, int pr_err)
 #endif
 
 /* return tgid for given pid */
-pid_t kdb_pid2tgid(pid_t pid)
+pid_t kdbx_pid2tgid(pid_t pid)
 {
     struct task_struct *tp = kdb_pid2tp(pid, 0);
 
@@ -460,7 +563,7 @@ pid_t kdb_pid2tgid(pid_t pid)
 static int kdb_str2gtgid(char *strp, pid_t *tgidp, int perr)
 {
     if ( kdb_str2deci(strp, (int *)tgidp) && kdb_pid2tp(*tgidp, perr) &&
-         kdb_pid_to_vcpu(*tgidp, perr) )
+         kdbx_pid_to_vcpu(*tgidp, perr) )
     {
         return 1;
     }
@@ -486,12 +589,12 @@ static int kdb_gfn_valid(struct kvm_vcpu *vp, ulong gfn, int prerr)
 }
 
 /* return a guest bitness: 32 or 64 */
-int kdb_guest_bitness(pid_t gpid)
+int kdbx_guest_bitness(pid_t gpid)
 {   
     if ( gpid == 0 )
         return 64;      /* host always 64 */
 
-    // kdbxp("FIXME: kdb_guest_bitness. returning 64 for now\n");
+    // kdbxp("FIXME: kdbx_guest_bitness. returning 64 for now\n");
     return 64;
 }
 
@@ -507,27 +610,27 @@ void kdbx_cpu_flush_vmcs(int tgt_cpu)
 
     for_each_online_cpu(cpu) {
         if (cpu == tgt_cpu) {
-            int savcmd = kdb_cpu_cmd[cpu];
+            int savcmd = kdbx_cpu_cmd[cpu];
 
 #if 0   /* could be called from read_mem() with SHOW_PC command */
-            if (kdb_cpu_cmd[cpu] != KDB_CPU_PAUSE){  /* hung cpu */
+            if (kdbx_cpu_cmd[cpu] != KDB_CPU_PAUSE){  /* hung cpu */
                 kdbxp("[%d]Skipping (hung?) cpu:%d cmd:%d\n", ccpu, cpu, 
-                      kdb_cpu_cmd[cpu]);
+                      kdbx_cpu_cmd[cpu]);
                 continue;
             }
 #endif
-            kdb_cpu_cmd[cpu] = KDB_CPU_DO_VMEXIT;
-            while (kdb_cpu_cmd[cpu] == KDB_CPU_DO_VMEXIT);
-            kdb_cpu_cmd[cpu] = savcmd;
+            kdbx_cpu_cmd[cpu] = KDB_CPU_DO_VMEXIT;
+            while (kdbx_cpu_cmd[cpu] == KDB_CPU_DO_VMEXIT);
+            kdbx_cpu_cmd[cpu] = savcmd;
             return;
         }
     }
 }
 
-ulong kdb_get_hvm_field(struct kvm_vcpu *vp, uint field)
+ulong kdbx_get_hvm_field(struct kvm_vcpu *vp, uint field)
 {
     if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL) { 
-        kdbxp("kdb_get_hvm_field: FIXME on AMD\n");
+        kdbxp("kdbx_get_hvm_field: FIXME on AMD\n");
         return 0xdeadbeefdeadbeef;
     }
     // kdb_all_cpu_flush_vmcs();
@@ -538,7 +641,7 @@ ulong kdb_get_hvm_field(struct kvm_vcpu *vp, uint field)
 
 /* kdb_on_host_rsp will not work because there is no stack switch upon exception
  * in host code executing on vexit */
-int kdb_guest_mode(struct pt_regs *regs)
+int kdbx_guest_mode(struct pt_regs *regs)
 {
     return !!( regs->flags & ((ulong)1 << 63) );
 }
@@ -564,7 +667,7 @@ int kdb_on_host_rsp(struct pt_regs *regs)
             if ( (vp = kp->vcpus[i]) == NULL )
                 continue;
 
-            host_sp = kdb_get_hvm_field(vp, HOST_RSP);
+            host_sp = kdbx_get_hvm_field(vp, HOST_RSP);
             if ( (host_sp & check_mask) == ((ulong)regs & check_mask) )
                 return 1;
         }
@@ -573,10 +676,11 @@ int kdb_on_host_rsp(struct pt_regs *regs)
 }
 #endif
 
-void kdb_display_pc(struct pt_regs *regs)
+/* kdbx always caches VCPU_REGS_RIP/VCPU_REGS_RSP upon vmexit */
+void kdbx_display_pc(struct pt_regs *regs)
 {  
-    if ( kdb_guest_mode(regs) ) {
-        struct kvm_vcpu *vp = kdb_pid_to_vcpu(current->pid, 0);
+    if ( kdbx_guest_mode(regs) ) {
+        struct kvm_vcpu *vp = kdbx_pid_to_vcpu(current->pid, 0);
         ulong ip = vp ? vp->arch.regs[VCPU_REGS_RIP] : 0;
         pid_t gpid = current->pid;
 
@@ -584,9 +688,9 @@ void kdb_display_pc(struct pt_regs *regs)
             kdbxp("guest_mode regs:%p has no vcpu\n", regs);
             return;
         }
-        kdb_print_instr(ip, 1, gpid);
+        kdbx_print_instr(ip, 1, gpid);
     } else 
-        kdb_print_instr(regs->KDBIP, 1, 0);
+        kdbx_print_instr(regs->KDBIP, 1, 0);
 }
 
 /* kdb_print_spin_lock(&xyz_lock, "xyz_lock:", "\n"); */
@@ -602,8 +706,7 @@ static void kdb_print_spin_lock(char *strp, spinlock_t *lkp, char *nlp)
 #endif
 
 #ifdef CONFIG_DEBUG_SPINLOCK
-    kdbxp("    magic:%x owner_cpu:%d owner:%p\n", lkp->rlock.magic, 
-         lkp->rlock.owner_cpu, lkp->owner);
+    kdbxp("   magic:%x owner_cpu:%d\n", lkp->rlock.magic, lkp->rlock.owner_cpu);
 #endif
 }
 
@@ -630,7 +733,7 @@ static char *kdb_regoffs_to_name(int offs)
     return NULL;
 }
 
-void kdb_vcpu_to_ptregs(struct kvm_vcpu *vp, struct pt_regs *regs)
+void kdbx_vcpu_to_ptregs(struct kvm_vcpu *vp, struct pt_regs *regs)
 {
     regs->r15 = vp->arch.regs[VCPU_REGS_R15];
     regs->r14 = vp->arch.regs[VCPU_REGS_R14];
@@ -650,7 +753,7 @@ void kdb_vcpu_to_ptregs(struct kvm_vcpu *vp, struct pt_regs *regs)
     regs->ip = vp->arch.regs[VCPU_REGS_RIP];
 }
 
-void kdb_ptregs_to_vcpu(struct kvm_vcpu *vp, struct pt_regs *regs)
+void kdbx_ptregs_to_vcpu(struct kvm_vcpu *vp, struct pt_regs *regs)
 {
     vp->arch.regs[VCPU_REGS_R15] = regs->r15;
     vp->arch.regs[VCPU_REGS_R14] = regs->r14;
@@ -707,7 +810,7 @@ static void kdb_prnt_timer(struct timer *tp)
 {
     kdbxp(" expires:%016lx cpu:%d status:%x\n", tp->expires, tp->cpu,tp->status);
     kdbxp(" function data:%p ptr:%p ", tp->data, tp->function);
-    kdb_prnt_addr2sym(DOMID_IDLE, (kdbva_t)tp->function, "\n");
+    kdbx_prnt_addr2sym(DOMID_IDLE, (kdbva_t)tp->function, "\n");
 }
 
 static void kdb_prnt_periodic_time(void)
@@ -728,13 +831,13 @@ static void kdb_prnt_periodic_time(void)
 
 /* ===================== cmd functions  ==================================== */
 
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_slk(void)
 {
     kdbxp("slk addr : show simple lock details\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_slk(int argc, const char **argv, struct pt_regs *regs)
 {
     ulong addr;
@@ -751,13 +854,13 @@ kdb_cmdf_slk(int argc, const char **argv, struct pt_regs *regs)
 }
 
 /* FUNCTION: disassemble */
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_dis(void)
 {
     kdbxp("dis [addr|sym][num][pid]: Disassemble instrs\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_dis(int argc, const char **argv, struct pt_regs *regs)
 {
     static kdbva_t addr = BFD_INVAL;
@@ -768,7 +871,7 @@ kdb_cmdf_dis(int argc, const char **argv, struct pt_regs *regs)
         return kdb_usgf_dis();
 
     if (argc == -1) {           /* command repeat */
-        addr = kdb_print_instr(addr, num, gpid);
+        addr = kdbx_print_instr(addr, num, gpid);
         return KDB_CPU_MAIN_KDB;
     }
 
@@ -787,12 +890,12 @@ kdb_cmdf_dis(int argc, const char **argv, struct pt_regs *regs)
     }
 
     if ( gpid == -1 ) {       /* user didn't enter pid */
-        if ( kdb_guest_mode(regs) )
+        if ( kdbx_guest_mode(regs) )
             gpid = current->pid;
         else
             gpid = 0;        /* regs->ip is in host */
     } else {
-        if ( !kdb_pid_to_vcpu(gpid, 0) )
+        if ( !kdbx_pid_to_vcpu(gpid, 0) )
             gpid = 0;        /* pid in host */
     }
 
@@ -806,28 +909,28 @@ kdb_cmdf_dis(int argc, const char **argv, struct pt_regs *regs)
         kdbxp("kdb:Invalid addr/sym\n");
         return KDB_CPU_MAIN_KDB;
     }
-    addr = kdb_print_instr(addr, num, gpid);
+    addr = kdbx_print_instr(addr, num, gpid);
 
     return KDB_CPU_MAIN_KDB;
 }
 
 /* FUNCTION: kdb_cmdf_dism() Toggle disassembly syntax from Intel to ATT/GAS */
-static kdb_cpu_cmd_t kdb_usgf_dism(void)
+static kdbx_cpu_cmd_t kdb_usgf_dism(void)
 {
     kdbxp("dism: toggle disassembly mode between ATT/GAS and INTEL\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_dism(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
         return kdb_usgf_dism();
 
-    kdb_toggle_dis_syntax();
+    kdbx_toggle_dis_syntax();
     return KDB_CPU_MAIN_KDB;
 }
 
-void kdb_show_stack(struct pt_regs *regs, pid_t pid)
+void kdbx_show_stack(struct pt_regs *regs, pid_t pid)
 {
     ulong spval, *sp_ptr;
     kdbva_t ip = 0; 
@@ -837,18 +940,19 @@ void kdb_show_stack(struct pt_regs *regs, pid_t pid)
     pid_t gpid = 0;
 
     if ( current->pid == pid ) {
-        if ( kdb_guest_mode(regs) ) {
-            vp = kdb_pid_to_vcpu(pid, 0);
+        if ( kdbx_guest_mode(regs) ) {
+            vp = kdbx_pid_to_vcpu(pid, 0);
             gpid = pid;
         }
     } else {
-        vp = kdb_pid_to_vcpu(pid, 0);
+        vp = kdbx_pid_to_vcpu(pid, 0);
         gpid = vp ? pid : 0;
     }
     KDBGP("f_f: pid:%d gpid:%d gmode:%d vp:%p\n", pid, gpid, 
-          kdb_guest_mode(regs), vp);
+          kdbx_guest_mode(regs), vp);
 
     if ( vp ) {
+        /* kdbx always caches VCPU_REGS_RIP/VCPU_REGS_RSP upon vmexit */
         ip = vp->arch.regs[VCPU_REGS_RIP];
         sp_ptr = (ulong *)vp->arch.regs[VCPU_REGS_RSP];
     } else if ( current->pid == pid || pid == 0 ) {
@@ -861,19 +965,19 @@ void kdb_show_stack(struct pt_regs *regs, pid_t pid)
         sp_ptr = (ulong *)tp->thread.sp;
     }
     if ( ip )
-        kdb_print_instr(ip, 1, gpid);
+        kdbx_print_instr(ip, 1, gpid);
 
-    if ( gpid && !kdb_guest_sym_loaded(gpid) )
+    if ( gpid && !kdbx_guest_sym_loaded(gpid) )
         return;
 
     for (printed = 0; printed < prmax; sp_ptr++) {
 
-        numrd = kdb_read_mem((kdbva_t)sp_ptr, (kdbbyt_t *)&spval, sz, vp);
+        numrd = kdbx_read_mem((kdbva_t)sp_ptr, (kdbbyt_t *)&spval, sz, vp);
         if (numrd != sz) 
             return;
 
         if ( kdb_addr_is_valid(spval, gpid) ) {
-            kdb_print_instr(spval, 1, gpid);
+            kdbx_print_instr(spval, 1, gpid);
             printed++;
         }
     }
@@ -882,13 +986,13 @@ void kdb_show_stack(struct pt_regs *regs, pid_t pid)
 
 /* display stack. if vcpu ptr given, then display stack for that. Otherwise,
  * use current regs */
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_f(void)
 {
     kdbxp("f [pid]: dump current/thread stack\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_f(int argc, const char **argv, struct pt_regs *regs)
 {
     pid_t pid = current->pid;
@@ -900,19 +1004,19 @@ kdb_cmdf_f(int argc, const char **argv, struct pt_regs *regs)
         if ( !kdb_str2pid(argv[1], &pid, 1) )
             return KDB_CPU_MAIN_KDB;
 
-    kdb_show_stack(regs, pid);
+    kdbx_show_stack(regs, pid);
 
     return KDB_CPU_MAIN_KDB;
 }
 
 /* Display kdb stack. for debugging kdb itself */
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_kdbf(void)
 {
     kdbxp("kdbf: display kdb stack. for debugging kdb only\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_kdbf(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
@@ -930,7 +1034,7 @@ _kdb_display_mem(kdbva_t *addrp, int *lenp, int wordsz, pid_t pid, int is_maddr)
     int numrd, bytes;
     int len = *lenp;
     kdbva_t addr = *addrp;
-    struct kvm_vcpu *vp = kdb_pid_to_vcpu(pid, 0);
+    struct kvm_vcpu *vp = kdbx_pid_to_vcpu(pid, 0);
 
     /* round len down to wordsz boundry because on intel endian, printing
      * characters is not prudent, (long and ints can't be interpreted 
@@ -942,9 +1046,9 @@ _kdb_display_mem(kdbva_t *addrp, int *lenp, int wordsz, pid_t pid, int is_maddr)
     KDBGP("dmem:addr:%lx buf:%p len:$%d sz:$%d pid:%d maddr:%d\n", addr,
           buf, len, wordsz, pid, is_maddr);
     if (is_maddr)
-        numrd = kdb_read_mmem((kdbma_t)addr, buf, len);
+        numrd = kdbx_read_mmem((kdbma_t)addr, buf, len);
     else
-        numrd = kdb_read_mem(addr, buf, len, vp);
+        numrd = kdbx_read_mem(addr, buf, len, vp);
 
     if ( numrd > len ) {
         kdbxp("Memory read error. len:%d Bytes read:$%d\n", len, numrd);
@@ -974,8 +1078,8 @@ _kdb_display_mem(kdbva_t *addrp, int *lenp, int wordsz, pid_t pid, int is_maddr)
 }
 
 /* display machine mem, ie, the given address is machine address */
-static kdb_cpu_cmd_t 
-kdb_display_mmem(int argc, const char **argv, int wordsz, kdb_usgf_t usg_fp)
+static kdbx_cpu_cmd_t 
+kdb_display_mmem(int argc, const char **argv, int wordsz, kdbx_usgf_t usg_fp)
 {
     static kdbma_t maddr;
     static int len;
@@ -1007,13 +1111,13 @@ kdb_display_mmem(int argc, const char **argv, int wordsz, kdb_usgf_t usg_fp)
 /* 
  * FUNCTION: Dispaly machine Memory Word
  */
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_dwm(void)
 {
     kdbxp("dwm:  maddr|sym [num] : dump memory word given machine addr\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_dwm(int argc, const char **argv, struct pt_regs *regs)
 {
     return kdb_display_mmem(argc, argv, 4, kdb_usgf_dwm);
@@ -1022,13 +1126,13 @@ kdb_cmdf_dwm(int argc, const char **argv, struct pt_regs *regs)
 /* 
  * FUNCTION: Dispaly machine Memory DoubleWord 
  */
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_ddm(void)
 {
     kdbxp("ddm:  maddr|sym [num] : dump double word given machine addr\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_ddm(int argc, const char **argv, struct pt_regs *regs)
 {
     return kdb_display_mmem(argc, argv, 8, kdb_usgf_ddm);
@@ -1041,8 +1145,8 @@ kdb_cmdf_ddm(int argc, const char **argv, struct pt_regs *regs)
  *           We display upto BUFSZ bytes. User can just press enter for more.
  *           addr is always in hex with or without leading 0x
  */
-static kdb_cpu_cmd_t 
-kdb_display_mem(int argc, const char **argv, int wordsz, kdb_usgf_t usg_fp)
+static kdbx_cpu_cmd_t 
+kdb_display_mem(int argc, const char **argv, int wordsz, kdbx_usgf_t usg_fp)
 {
     static kdbva_t addr;
     static int len;
@@ -1061,7 +1165,7 @@ kdb_display_mem(int argc, const char **argv, int wordsz, kdb_usgf_t usg_fp)
             return KDB_CPU_MAIN_KDB;
     }
 
-    gpid = kdb_pid_to_vcpu(gpid, 0) ? gpid : 0;
+    gpid = kdbx_pid_to_vcpu(gpid, 0) ? gpid : 0;
 
     /* check if num of bytes to display is given by user */
     if (argc >= 3) {
@@ -1084,13 +1188,13 @@ kdb_display_mem(int argc, const char **argv, int wordsz, kdb_usgf_t usg_fp)
 /* 
  * FUNCTION: Dispaly Memory Word
  */
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_dw(void)
 {
     kdbxp("dw vaddr|sym [num][pid]: display word. num required for pid\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_dw(int argc, const char **argv, struct pt_regs *regs)
 {
     return kdb_display_mem(argc, argv, 4, kdb_usgf_dw);
@@ -1099,24 +1203,24 @@ kdb_cmdf_dw(int argc, const char **argv, struct pt_regs *regs)
 /* 
  * FUNCTION: Dispaly Memory DoubleWord 
  */
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_dd(void)
 {
     kdbxp("dd vaddr|sym [num][pid]: display dword. num required for pid\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_dd(int argc, const char **argv, struct pt_regs *regs)
 {
     return kdb_display_mem(argc, argv, 8, kdb_usgf_dd);
 }
 
-static kdb_cpu_cmd_t kdb_usgf_mw(void)
+static kdbx_cpu_cmd_t kdb_usgf_mw(void)
 {
     kdbxp("mw vaddr|sym val [pid]: modify memory word in vaddr\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_mw(int argc, const char **argv, struct pt_regs *regs)
 {
     pid_t gpid;
@@ -1133,7 +1237,7 @@ kdb_cmdf_mw(int argc, const char **argv, struct pt_regs *regs)
     } else 
         gpid = current->pid;
 
-    gpid = (vp = kdb_pid_to_vcpu(gpid, 0)) ? gpid : 0;
+    gpid = (vp = kdbx_pid_to_vcpu(gpid, 0)) ? gpid : 0;
 
     if (!kdb_str2ulong(argv[2], &val)) {
         kdbxp("Invalid val: %s\n", argv[2]);
@@ -1143,7 +1247,7 @@ kdb_cmdf_mw(int argc, const char **argv, struct pt_regs *regs)
         kdbxp("Invalid addr/sym: %s\n", argv[1]);
         return KDB_CPU_MAIN_KDB;
     }
-    if (kdb_write_mem(addr, (kdbbyt_t *)&val, 4, vp) != 4)
+    if (kdbx_write_mem(addr, (kdbbyt_t *)&val, 4, vp) != 4)
         kdbxp("Unable to set 0x%lx to 0x%lx\n", addr, val);
 
     return KDB_CPU_MAIN_KDB;
@@ -1152,13 +1256,13 @@ kdb_cmdf_mw(int argc, const char **argv, struct pt_regs *regs)
 /* 
  * FUNCTION: Modify Memory DoubleWord 
  */
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_md(void)
 {
     kdbxp("md vaddr|sym val [pid]: modify memory dword in vaddr\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_md(int argc, const char **argv, struct pt_regs *regs)
 {
     pid_t gpid;
@@ -1175,7 +1279,7 @@ kdb_cmdf_md(int argc, const char **argv, struct pt_regs *regs)
     } else 
         gpid = current->pid;
 
-    gpid = (vp = kdb_pid_to_vcpu(gpid, 0)) ? gpid : 0;
+    gpid = (vp = kdbx_pid_to_vcpu(gpid, 0)) ? gpid : 0;
 
     if (!kdb_str2ulong(argv[2], &val)) {
         kdbxp("Invalid val: %s\n", argv[2]);
@@ -1185,7 +1289,7 @@ kdb_cmdf_md(int argc, const char **argv, struct pt_regs *regs)
         kdbxp("Invalid addr/sym: %s\n", argv[1]);
         return KDB_CPU_MAIN_KDB;
     }
-    if (kdb_write_mem(addr, (kdbbyt_t *)&val, sizeof(val), vp) != sizeof(val))
+    if (kdbx_write_mem(addr, (kdbbyt_t *)&val, sizeof(val), vp) != sizeof(val))
         kdbxp("Unable to set 0x%lx to 0x%lx\n", addr, val);
 
     return KDB_CPU_MAIN_KDB;
@@ -1195,6 +1299,14 @@ struct  Xgt_desc_struct {
     unsigned short size;
     unsigned long address __attribute__((packed));
 };
+
+static ulong kdbx_read_cr3(void)
+{
+    unsigned long val;
+
+    asm volatile("mov %%cr3,%0\n\t" : "=r" (val), "=m" (__force_order));
+    return val;
+}
 
 void kdb_show_special_regs(void)
 {
@@ -1209,7 +1321,7 @@ void kdb_show_special_regs(void)
     kdbxp("GDTR: addr: %016lx limit: %04x\n", desc.address, desc.size);
 
     kdbxp("cr0: %016lx  cr2: %016lx\n", read_cr0(), read_cr2());
-    kdbxp("cr3: %016lx  cr4: %016lx\n", __native_read_cr3(), __read_cr4());
+    kdbxp("cr3: %016lx  cr4: %016lx\n", kdbx_read_cr3(), __read_cr4());
     __asm__ __volatile__ ("str (%0) \n":: "a"(&tr) : "memory");
     kdbxp("TR: %x\n", tr);
 
@@ -1217,15 +1329,15 @@ void kdb_show_special_regs(void)
     kdbxp("efer:"KDBF64" LMA(IA-32e mode):%d SCE(syscall/sysret):%d\n",
          efer, ((efer&EFER_LMA) != 0), ((efer&EFER_SCE) != 0));
 
-    kdbxp("DR0: %016lx  DR1:%016lx  DR2:%016lx\n", kdb_rd_dbgreg(0),
-         kdb_rd_dbgreg(1), kdb_rd_dbgreg(2)); 
-    kdbxp("DR3: %016lx  DR6:%016lx  DR7:%016lx\n", kdb_rd_dbgreg(3),
-         kdb_rd_dbgreg(6), kdb_rd_dbgreg(7)); 
+    kdbxp("DR0: %016lx  DR1:%016lx  DR2:%016lx\n", kdbx_rd_dbgreg(0),
+         kdbx_rd_dbgreg(1), kdbx_rd_dbgreg(2)); 
+    kdbxp("DR3: %016lx  DR6:%016lx  DR7:%016lx\n", kdbx_rd_dbgreg(3),
+         kdbx_rd_dbgreg(6), kdbx_rd_dbgreg(7)); 
 }
 
-void kdb_print_regs(struct pt_regs *regs)
+void kdbx_print_regs(struct pt_regs *regs)
 {
-    int guest_mode = kdb_guest_mode(regs);
+    int guest_mode = kdbx_guest_mode(regs);
 
 #ifdef __x86_64__
     kdbxp("        rip: %016lx   rsp: %016lx   rbp: %016lx\n", 
@@ -1263,12 +1375,12 @@ void kdb_print_regs(struct pt_regs *regs)
 /* 
  * FUNCTION: Dispaly Registers. If "sp" argument, then display additional regs
  */
-static kdb_cpu_cmd_t kdb_usgf_dr(void)
+static kdbx_cpu_cmd_t kdb_usgf_dr(void)
 {
     kdbxp("dr [sp]: display registers. sp to display special regs also\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_dr(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
@@ -1277,9 +1389,9 @@ kdb_cmdf_dr(int argc, const char **argv, struct pt_regs *regs)
     KDBGP1("regs:%p .rsp:%lx .rip:%lx\n", regs, regs->sp, regs->ip);
     /* show_regs(regs); */ /* uses printk, so output to dmesg only */
 
-    kdbxp("[%c]current task:%p comm:%s\n", kdb_guest_mode(regs) ? 'G' : 'H',
+    kdbxp("[%c]current task:%p comm:%s\n", kdbx_guest_mode(regs) ? 'G' : 'H',
           current, current->comm);
-    kdb_print_regs(regs);
+    kdbx_print_regs(regs);
 
     if (argc > 1 && !strcmp(argv[1], "sp")) 
         kdb_show_special_regs();
@@ -1290,12 +1402,12 @@ kdb_cmdf_dr(int argc, const char **argv, struct pt_regs *regs)
 /* 
  * FUNCTION: Modify Register
  */
-static kdb_cpu_cmd_t kdb_usgf_mr(void)
+static kdbx_cpu_cmd_t kdb_usgf_mr(void)
 {
     kdbxp("mr reg val : Modify Register. val assumed in hex\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_mr(int argc, const char **argv, struct pt_regs *regs)
 {
     const char *argp;
@@ -1339,20 +1451,20 @@ kdb_cmdf_mr(int argc, const char **argv, struct pt_regs *regs)
 /* 
  * FUNCTION: Single Step
  */
-static kdb_cpu_cmd_t kdb_usgf_ss(void)
+static kdbx_cpu_cmd_t kdb_usgf_ss(void)
 {
     kdbxp("ss: single step\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_ss(int argc, const char **argv, struct pt_regs *regs)
 {
     #define KDB_HALT_INSTR 0xf4
 
     kdbbyt_t byte;
     int ccpu = smp_processor_id();
-    int guest_mode = kdb_guest_mode(regs);
-    struct kvm_vcpu *vp = guest_mode ? kdb_pid_to_vcpu(current->pid, 0) : NULL;
+    int guest_mode = kdbx_guest_mode(regs);
+    struct kvm_vcpu *vp = guest_mode ? kdbx_pid_to_vcpu(current->pid, 0) : NULL;
 
     if (argc > 1 && *argv[1] == '?')
         return kdb_usgf_ss();
@@ -1362,7 +1474,7 @@ kdb_cmdf_ss(int argc, const char **argv, struct pt_regs *regs)
         kdbxp("%s: regs not available\n", __FUNCTION__);
         return KDB_CPU_MAIN_KDB;
     }
-    if (kdb_read_mem(regs->KDBIP, &byte, 1, vp) == 1) {
+    if (kdbx_read_mem(regs->KDBIP, &byte, 1, vp) == 1) {
         if (byte == KDB_HALT_INSTR) {
             kdbxp("kdb: jumping over halt instruction\n");
             regs->KDBIP++;
@@ -1383,17 +1495,17 @@ kdb_cmdf_ss(int argc, const char **argv, struct pt_regs *regs)
 /* 
  * FUNCTION: Next Instruction, step over the call instr to the next instr
  */
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_ni(void)
 {
     kdbxp("ni: single step, stepping over function calls\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_ni(int argc, const char **argv, struct pt_regs *regs)
 {
     int sz, i;
-    pid_t gpid = kdb_guest_mode(regs) ? current->pid : 0;
+    pid_t gpid = kdbx_guest_mode(regs) ? current->pid : 0;
 
     if (argc > 1 && *argv[1] == '?')
         return kdb_usgf_ni();
@@ -1403,7 +1515,7 @@ kdb_cmdf_ni(int argc, const char **argv, struct pt_regs *regs)
         kdbxp("%s: regs not available\n", __FUNCTION__);
         return KDB_CPU_MAIN_KDB;
     }
-    if ((sz=kdb_check_call_instr(regs->KDBIP, gpid)) == 0)  /* !call instr */
+    if ((sz=kdbx_check_call_instr(regs->KDBIP, gpid)) == 0)  /* !call instr */
         return kdb_cmdf_ss(argc, argv, regs);         /* just do ss */
 
     if ( (i = kdb_set_bp(gpid,regs->KDBIP+sz,1,0,0,0,0)) >= KDBMAXSBP)/*failed*/
@@ -1426,13 +1538,13 @@ kdb_btf_enable(void)
 /* 
  * FUNCTION: Single Step to branch. Doesn't seem to work very well.
  */
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_ssb(void)
 {
     kdbxp("ssb: singe step to branch\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_ssb(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
@@ -1452,13 +1564,13 @@ kdb_cmdf_ssb(int argc, const char **argv, struct pt_regs *regs)
  * FUNCTION: Continue Execution. TF must be cleared here as this could run on 
  *           any cpu. Hence not OK to do it from kdb_end_session.
  */
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_go(void)
 {
     kdbxp("go: leave kdb and continue execution\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_go(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
@@ -1469,7 +1581,7 @@ kdb_cmdf_go(int argc, const char **argv, struct pt_regs *regs)
 }
 
 /* All cpus must display their current context */
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cpu_status_all(int ccpu, struct pt_regs *regs)
 {
     int cpu;
@@ -1477,12 +1589,12 @@ kdb_cpu_status_all(int ccpu, struct pt_regs *regs)
     for_each_online_cpu(cpu) {
         if (cpu == ccpu) {
             kdbxp("[%d]", ccpu);
-            kdb_display_pc(regs);
+            kdbx_display_pc(regs);
         } else {
-            if (kdb_cpu_cmd[cpu] != KDB_CPU_PAUSE)   /* hung cpu */
+            if (kdbx_cpu_cmd[cpu] != KDB_CPU_PAUSE)   /* hung cpu */
                 continue;
-            kdb_cpu_cmd[cpu] = KDB_CPU_SHOWPC;
-            while (kdb_cpu_cmd[cpu]==KDB_CPU_SHOWPC);
+            kdbx_cpu_cmd[cpu] = KDB_CPU_SHOWPC;
+            while (kdbx_cpu_cmd[cpu]==KDB_CPU_SHOWPC);
         }
     }
     return KDB_CPU_MAIN_KDB;
@@ -1496,14 +1608,14 @@ kdb_cpu_status_all(int ccpu, struct pt_regs *regs)
  *     "all":  show one line status of all cpus
  */
 extern volatile int kdb_init_cpu;
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_cpu(void)
 {
     kdbxp("cpu [all|num]: none will switch back to initial cpu\n");
     kdbxp("               cpunum to switch to the vcpu. all to show status\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_cpu(int argc, const char **argv, struct pt_regs *regs)
 {
     int cpu;
@@ -1518,10 +1630,10 @@ kdb_cmdf_cpu(int argc, const char **argv, struct pt_regs *regs)
 
         cpu = (int)simple_strtoul(argv[1], NULL, 0); /* handles 0x */
         if (cpu >= 0 && cpu < NR_CPUS && cpu != ccpu && 
-            cpu_online(cpu) && kdb_cpu_cmd[cpu] == KDB_CPU_PAUSE)
+            cpu_online(cpu) && kdbx_cpu_cmd[cpu] == KDB_CPU_PAUSE)
         {
             kdbxp("Switching to cpu:%d\n", cpu);
-            kdb_cpu_cmd[cpu] = KDB_CPU_MAIN_KDB;
+            kdbx_cpu_cmd[cpu] = KDB_CPU_MAIN_KDB;
 
             /* clear any single step on the current cpu */
             regs->flags &= ~X86_EFLAGS_TF; /* vmx clears on vmexit */
@@ -1530,16 +1642,16 @@ kdb_cmdf_cpu(int argc, const char **argv, struct pt_regs *regs)
             if (cpu != ccpu)
                 kdbxp("Unable to switch to cpu:%d\n", cpu);
             else {
-                kdb_display_pc(regs);
+                kdbx_display_pc(regs);
             }
             return KDB_CPU_MAIN_KDB;
         }
     }
     /* no arg means back to initial cpu */
-    if (!kdb_sys_crash && ccpu != kdb_init_cpu) {
-        if (kdb_cpu_cmd[kdb_init_cpu] == KDB_CPU_PAUSE) {
+    if (!kdbx_sys_crash && ccpu != kdb_init_cpu) {
+        if (kdbx_cpu_cmd[kdb_init_cpu] == KDB_CPU_PAUSE) {
             regs->flags &= ~X86_EFLAGS_TF;
-            kdb_cpu_cmd[kdb_init_cpu] = KDB_CPU_MAIN_KDB;
+            kdbx_cpu_cmd[kdb_init_cpu] = KDB_CPU_MAIN_KDB;
             return KDB_CPU_PAUSE;
         } else
             kdbxp("Unable to switch to: %d\n", kdb_init_cpu);
@@ -1548,13 +1660,13 @@ kdb_cmdf_cpu(int argc, const char **argv, struct pt_regs *regs)
 }
 
 /* send NMI to all or given CPU. Must be crashed/fatal state */
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_nmi(void)
 {
     kdbxp("nmi cpu#|all: send nmi to cpu/s. must reboot when done with kdb\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_nmi(int argc, const char **argv, struct pt_regs *regs)
 {
     struct cpumask cpumask;
@@ -1564,7 +1676,7 @@ kdb_cmdf_nmi(int argc, const char **argv, struct pt_regs *regs)
         return kdb_usgf_nmi();
 
 #if 0
-    if (!kdb_sys_crash) {
+    if (!kdbx_sys_crash) {
         kdbxp("kdb: nmi cmd available in crashed state only\n");
         return KDB_CPU_MAIN_KDB;
     }
@@ -1581,7 +1693,7 @@ kdb_cmdf_nmi(int argc, const char **argv, struct pt_regs *regs)
             return KDB_CPU_MAIN_KDB;
         }
     }
-    kdb_nmi_pause_cpus(cpumask);
+    kdbx_nmi_pause_cpus(cpumask);
     return KDB_CPU_MAIN_KDB;
 }
 
@@ -1596,13 +1708,13 @@ static int kdb_prnt_pcpu_offs(void)
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_pcpu(void)
 {
     kdbxp("pcpu cpunum|\"offs\": display per cpu vars for the cpu\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_pcpu(int argc, const char **argv, struct pt_regs *regs)
 {
     int cpu;
@@ -1627,6 +1739,27 @@ kdb_cmdf_pcpu(int argc, const char **argv, struct pt_regs *regs)
 }
 
 /* ========================= Breakpoints ==================================== */
+static void kdbx_enable_bp_vmexit(struct kvm *kp)
+{
+    struct kvm_vcpu *vp;
+    int i;
+
+    for (i = 0; i < KVM_MAX_VCPUS; i++) {
+        if ( (vp = kp->vcpus[i]) )
+        vp->guest_debug |= KVM_GUESTDBG_USE_SW_BP;
+    }
+}
+
+static void kdbx_disable_bp_vmexit(struct kvm *kp)
+{
+    struct kvm_vcpu *vp;
+    int i;
+
+    for (i = 0; i < KVM_MAX_VCPUS; i++) {
+        if ( (vp = kp->vcpus[i]) )
+        vp->guest_debug &= ~KVM_GUESTDBG_USE_SW_BP;
+    }
+}
 
 static void
 kdb_prnt_bp_cond(int bpnum)
@@ -1665,17 +1798,17 @@ kdb_prnt_bp_extra(int bpnum)
 /*
  * List software breakpoints
  */
-static kdb_cpu_cmd_t kdb_display_sbkpts(void)
+static kdbx_cpu_cmd_t kdb_display_sbkpts(void)
 {
     int i;
 
     for(i = 0; i < KDBMAXSBP; i++) {
         if (kdb_sbpa[i].bp_addr && !kdb_sbpa[i].bp_deleted) {
             pid_t pid = kdb_sbpa[i].bp_pid;
-            pid_t gpid = kdb_pid_to_vcpu(pid, 0) ? pid : 0;
+            pid_t gpid = kdbx_pid_to_vcpu(pid, 0) ? pid : 0;
 
             kdbxp("[%d]: pid:%d 0x%lx   ", i, pid, kdb_sbpa[i].bp_addr);
-            kdb_prnt_addr2sym(gpid, kdb_sbpa[i].bp_addr, "\n");
+            kdbx_prnt_addr2sym(gpid, kdb_sbpa[i].bp_addr, "\n");
             kdb_prnt_bp_extra(i);
         }
     }
@@ -1686,7 +1819,7 @@ static kdb_cpu_cmd_t kdb_display_sbkpts(void)
  * Check if any breakpoints that we need to install (delayed install)
  * Returns: 1 if yes, 0 if none.
  */
-int kdb_swbp_exists(void)
+int kdbx_swbp_exists(void)
 {
     int i;
 
@@ -1715,7 +1848,7 @@ static int kdb_swbp_deleted(void)
 /*
  * Flush deleted sw breakpoints
  */
-void kdb_flush_swbp_table(void)
+void kdbx_flush_swbp_table(void)
 {
 #if 0
     int i;
@@ -1734,11 +1867,9 @@ void kdb_flush_swbp_table(void)
 static void kdb_del_pid_bp(int idx)
 {
     pid_t pid = kdb_sbpa[idx].bp_pid;
-    struct kvm_vcpu *vp = kdb_pid_to_vcpu(pid, 0);
+    struct kvm_vcpu *vp = kdbx_pid_to_vcpu(pid, 0);
 
-    if ( vp ) 
-        vp->guest_debug &= ~KVM_GUESTDBG_USE_SW_BP;
-
+    kdbx_disable_bp_vmexit(vp->kvm);
     kdbxp("Deleted breakpoint [%x] addr:0x%lx pid:%d\n", 
           (int)idx, kdb_sbpa[idx].bp_addr, pid);
 }
@@ -1746,12 +1877,12 @@ static void kdb_del_pid_bp(int idx)
 /*
  * Delete/Clear a sw breakpoint
  */
-static kdb_cpu_cmd_t kdb_usgf_bc(void)
+static kdbx_cpu_cmd_t kdb_usgf_bc(void)
 {
     kdbxp("bc $num|all : clear given or all breakpoints\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_bc(int argc, const char **argv, struct pt_regs *regs)
 {
     int i, bpnum = -1, delall = 0;
@@ -1760,7 +1891,7 @@ kdb_cmdf_bc(int argc, const char **argv, struct pt_regs *regs)
     if (argc != 2 || *argv[1] == '?')
         return kdb_usgf_bc();
 
-    if (!kdb_swbp_exists()) {
+    if (!kdbx_swbp_exists()) {
         kdbxp("No breakpoints are set\n");
         return KDB_CPU_MAIN_KDB;
     }
@@ -1819,13 +1950,13 @@ static int kdb_install_swbp(int idx)         /* which entry in the bp array */
     kdbva_t addr = kdb_sbpa[idx].bp_addr;
     kdbbyt_t *p = &kdb_sbpa[idx].bp_originst;
     pid_t pid = kdb_sbpa[idx].bp_pid;
-    struct kvm_vcpu *vp = kdb_pid_to_vcpu(pid, 0);
+    struct kvm_vcpu *vp = kdbx_pid_to_vcpu(pid, 0);
 
     if ( kdb_sbpa[idx].bp_deleted ) {
         kdbxp("[%d]Trying to install deleted bp:%d\n", smp_processor_id(), idx);
         return 0;
     }
-    if (kdb_read_mem(addr, p, KDBBPSZ, vp) != KDBBPSZ) {
+    if (kdbx_read_mem(addr, p, KDBBPSZ, vp) != KDBBPSZ) {
         kdbxp("Failed(R) to install bp:%x at:0x%lx pid:%d. Deleted.\n",
               idx, kdb_sbpa[idx].bp_addr, kdb_sbpa[idx].bp_pid);
 
@@ -1837,7 +1968,7 @@ static int kdb_install_swbp(int idx)         /* which entry in the bp array */
     }
 
     KDBGP1("install swbp: addr:%lx bpinst:%x sz:%d\n", addr,kdb_bpinst,KDBBPSZ);
-    if (kdb_write_mem(addr, &kdb_bpinst, KDBBPSZ, vp) != KDBBPSZ) {
+    if (kdbx_write_mem(addr, &kdb_bpinst, KDBBPSZ, vp) != KDBBPSZ) {
         kdbxp("Failed(W) to install bp:%x at:0x%lx pid:%d. Deleted\n",
               idx, kdb_sbpa[idx].bp_addr, kdb_sbpa[idx].bp_pid);
 
@@ -1856,7 +1987,7 @@ static int kdb_install_swbp(int idx)         /* which entry in the bp array */
 /*
  * Install all the software breakpoints
  */
-void kdb_install_all_swbp(void)
+void kdbx_install_all_swbp(void)
 {
     int i;
     for(i=0; i < KDBMAXSBP; i++)
@@ -1869,20 +2000,20 @@ static void kdb_uninstall_a_swbp(int i)
     kdbva_t addr = kdb_sbpa[i].bp_addr;
     kdbbyt_t originst = kdb_sbpa[i].bp_originst;
     pid_t pid = kdb_sbpa[i].bp_pid;
-    struct kvm_vcpu *vp = kdb_pid_to_vcpu(pid, 0);
+    struct kvm_vcpu *vp = kdbx_pid_to_vcpu(pid, 0);
 
     kdb_sbpa[i].bp_just_added = 0;
     if (!addr)
         return;
 
-    if (kdb_write_mem(addr, &originst, KDBBPSZ, vp) != KDBBPSZ) {
+    if (kdbx_write_mem(addr, &originst, KDBBPSZ, vp) != KDBBPSZ) {
         kdbxp("Failed to uninstall breakpoint %x at:0x%lx pid:%d\n",
              i, kdb_sbpa[i].bp_addr, pid);
     }
 }
 
 /* Uninstall all the software breakpoints at beginning of kdb session */
-void kdb_uninstall_all_swbp(void)
+void kdbx_uninstall_all_swbp(void)
 {
     int i;
     for(i=0; i < KDBMAXSBP; i++) 
@@ -1896,7 +2027,7 @@ static int kdb_check_bp_condition(int bpnum, struct pt_regs *regs)
     ulong res = 0, lhsval=0;
     struct kdb_bpcond *bpcp = &kdb_sbpa[bpnum].u.bp_cond;
     pid_t gpid = kdb_sbpa[bpnum].bp_pid;
-    struct kvm_vcpu *vp = kdb_pid_to_vcpu(gpid, 0);
+    struct kvm_vcpu *vp = kdbx_pid_to_vcpu(gpid, 0);
 
     if (bpcp->bp_cond_status == 1) {             /* register condition */
         uint64_t *rp = (uint64_t *)((char *)regs + bpcp->bp_cond_lhs);
@@ -1905,7 +2036,7 @@ static int kdb_check_bp_condition(int bpnum, struct pt_regs *regs)
         ulong addr = bpcp->bp_cond_lhs;
         int num = sizeof(lhsval);
 
-        if (kdb_read_mem(addr, (kdbbyt_t *)&lhsval, num, vp) != num) {
+        if (kdbx_read_mem(addr, (kdbbyt_t *)&lhsval, num, vp) != num) {
             kdbxp("kdb: unable to read %d bytes at %lx\n", num, addr);
             return 3;
         }
@@ -1930,16 +2061,16 @@ static void kdb_prnt_btp_info(int bpnum, struct pt_regs *regs)
 {
     ulong i, arg, val, num, *btp = kdb_sbpa[bpnum].u.bp_btp;
     pid_t gpid = kdb_sbpa[bpnum].bp_pid;
-    struct kvm_vcpu *vp = kdb_pid_to_vcpu(gpid, 1);
+    struct kvm_vcpu *vp = kdbx_pid_to_vcpu(gpid, 1);
 
-    kdb_prnt_addr2sym(gpid, regs->KDBIP, "\n");
+    kdbx_prnt_addr2sym(gpid, regs->KDBIP, "\n");
     num = sizeof(ulong);
     for (i=0; i < KDB_MAXBTP && (arg=btp[i]); i++) {
         if (arg < sizeof (struct pt_regs)) {
             uint64_t *rp = (uint64_t *)((char *)regs + arg);
             kdbxp(" %s: %016lx ", kdb_regoffs_to_name(arg), *rp);
         } else {
-            if (kdb_read_mem(arg, (kdbbyt_t *)&val, num, vp) != num)
+            if (kdbx_read_mem(arg, (kdbbyt_t *)&val, num, vp) != num)
                 kdbxp("kdb: unable to read %d bytes at %lx\n", num, arg);
             if (num == 8)
                 kdbxp(" %016lx:%016lx ", arg, val);
@@ -1956,7 +2087,7 @@ static int kdb_bp_pid_match(pid_t bp_pid)
 {
     pid_t cpid = current->pid;
 
-    if ( cpid == bp_pid || kdb_pid2tgid(cpid) == kdb_pid2tgid(bp_pid) )
+    if ( cpid == bp_pid || kdbx_pid2tgid(cpid) == kdbx_pid2tgid(bp_pid) )
         return 1;
 
 kdbxp("[%d]BP PID doesn't match..bp_pid:%d cur:%d\n",smp_processor_id(),  
@@ -1967,7 +2098,7 @@ kdbxp("[%d]BP PID doesn't match..bp_pid:%d cur:%d\n",smp_processor_id(),
 /* vmx doesn't increase the IP by 1 on bp. Check and *change* here */
 static int kdb_bp_addr_match(struct pt_regs *regs, ulong bp_addr)
 {
-    if ( kdb_guest_mode(regs) )
+    if ( kdbx_guest_mode(regs) )
         return bp_addr == regs->KDBIP;
 
     /* host mode */
@@ -1985,7 +2116,7 @@ static int kdb_bp_addr_match(struct pt_regs *regs, ulong bp_addr)
  *         2 : one of ours but condition not met, or btp. IP decremented.(leave)
  *         3 : one of ours and active. IP decremented. (stay in kdb)
  */
-int kdb_check_sw_bkpts(struct pt_regs *regs)
+int kdbx_check_sw_bkpts(struct pt_regs *regs)
 {
     int i, rc = 0;
 
@@ -2027,8 +2158,8 @@ int kdb_check_sw_bkpts(struct pt_regs *regs)
  * condp : points to != or ==
  * rhsval : right hand side value
  */
-static void
-kdb_set_bp_cond(int bpnum, int regoffs, ulong addr, char *condp, ulong rhsval)
+static void kdb_set_bp_cond(int bpnum, int regoffs, ulong addr, 
+                            char *condp, ulong rhsval)
 {
     if (bpnum >= KDBMAXSBP) {
         kdbxp("BUG: %s got invalid bpnum\n", __FUNCTION__);
@@ -2060,22 +2191,24 @@ kdb_set_bp_cond(int bpnum, int regoffs, ulong addr, char *condp, ulong rhsval)
  *
  * RETURNS: the index in array where installed. KDBMAXSBP if error 
  */
-static int
-kdb_set_bp(pid_t pid, kdbva_t addr, int ni, ulong *btpa, char *lhsp, 
-           char *condp, char *rhsp)
+static int kdb_set_bp(pid_t pid, kdbva_t addr, int ni, ulong *btpa, char *lhsp,
+                      char *condp, char *rhsp)
 {
     int i, pre_existing = 0, regoffs = -1;
     ulong memloc=0, rhsval=0, tmpul;
-    struct kvm_vcpu *vp = kdb_pid_to_vcpu(pid, 0);
+    struct kvm_vcpu *vp = pid ? kdbx_pid_to_vcpu(pid, 1) : NULL;
     int gpid = vp ? pid : 0;
 
+    if ( pid && vp == NULL )
+        return KDBMAXSBP;
+        
     if ( btpa && (lhsp || rhsp || condp) ) {
         kdbxp("internal error. btpa and (lhsp || rhsp || condp) set\n");
         return KDBMAXSBP;
     }
     if ( lhsp && ((regoffs=kdb_valid_reg(lhsp)) == -1)  &&
          kdb_str2ulong(lhsp, &memloc) &&
-         kdb_read_mem(memloc, (kdbbyt_t *)&tmpul, sizeof(tmpul), vp) == 0) {
+         kdbx_read_mem(memloc, (kdbbyt_t *)&tmpul, sizeof(tmpul), vp) == 0) {
 
         kdbxp("error: invalid argument: %s\n", lhsp);
         return KDBMAXSBP;
@@ -2090,7 +2223,7 @@ kdb_set_bp(pid_t pid, kdbva_t addr, int ni, ulong *btpa, char *lhsp,
         pid_t bp_addr = kdb_sbpa[i].bp_addr;
         pid_t bp_pid = kdb_sbpa[i].bp_pid;
 
-        if ( bp_addr == addr && kdb_pid2tgid(bp_pid) == kdb_pid2tgid(pid) ) {
+        if ( bp_addr == addr && kdbx_pid2tgid(bp_pid) == kdbx_pid2tgid(pid) ) {
             if (kdb_sbpa[i].bp_deleted) {
                 /* just re-set this bp again */
                 memset(&kdb_sbpa[i], 0, sizeof(kdb_sbpa[i]));
@@ -2134,7 +2267,7 @@ kdb_set_bp(pid_t pid, kdbva_t addr, int ni, ulong *btpa, char *lhsp,
                  kdb_sbpa[i].bp_addr);
         else 
             kdbxp("bp %d set at: 0x%lx ", i, kdb_sbpa[i].bp_addr);
-        kdb_prnt_addr2sym(gpid, addr, "\n");
+        kdbx_prnt_addr2sym(gpid, addr, "\n");
         kdb_prnt_bp_extra(i);
     } else {
         kdbxp("ERROR:Can't install bp: 0x%lx pid:%d\n", addr, pid);
@@ -2145,15 +2278,14 @@ kdb_set_bp(pid_t pid, kdbva_t addr, int ni, ulong *btpa, char *lhsp,
 
         return KDBMAXSBP;
     }
-
     if ( vp )
-        vp->guest_debug |= KVM_GUESTDBG_USE_SW_BP;
+        kdbx_enable_bp_vmexit(vp->kvm);
 
     return i;
 }
 
 /* Set/List Software Breakpoint/s */
-static kdb_cpu_cmd_t kdb_usgf_bp(void)
+static kdbx_cpu_cmd_t kdb_usgf_bp(void)
 {
     kdbxp("bp [addr|sym][pid][condition]: display or set a breakpoint\n");
     kdbxp("  where cond is like: r6 == 0x123F or rax != DEADBEEF or \n");
@@ -2162,7 +2294,7 @@ static kdb_cpu_cmd_t kdb_usgf_bp(void)
     kdbxp(" r10 r11 r12 r13 r14 r15 rflags\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_bp(int argc, const char **argv, struct pt_regs *regs)
 {
     kdbva_t addr;
@@ -2173,7 +2305,7 @@ kdb_cmdf_bp(int argc, const char **argv, struct pt_regs *regs)
     if ((argc > 1 && *argv[1] == '?') || argc == 4 || argc > 6)
         return kdb_usgf_bp();
 
-    if (argc < 2 || kdb_sys_crash)         /* list all set breakpoints */
+    if (argc < 2 || kdbx_sys_crash)         /* list all set breakpoints */
         return kdb_display_sbkpts();
 
     /* valid argc either: 2 3 5 or 6 
@@ -2196,7 +2328,7 @@ kdb_cmdf_bp(int argc, const char **argv, struct pt_regs *regs)
         return kdb_usgf_bp();
     }
 
-    gpid = kdb_pid_to_vcpu(pid, 0) ? pid : 0;
+    gpid = kdbx_pid_to_vcpu(pid, 0) ? pid : 0;
 
     if (!kdb_str2addr(argv[1], &addr, gpid) || addr == 0) {
         kdbxp("Invalid argument:%s\n", argv[1]);
@@ -2215,7 +2347,7 @@ kdb_cmdf_bp(int argc, const char **argv, struct pt_regs *regs)
 }
 
 /* trace breakpoint, meaning, upon bp trace/print some info and continue */
-static kdb_cpu_cmd_t kdb_usgf_btp(void)
+static kdbx_cpu_cmd_t kdb_usgf_btp(void)
 {
     kdbxp("btp addr|sym [pid] reg|mem-addr... :  breakpoint trace\n");
     kdbxp("  regs: rax rbx rcx rdx rsi rdi rbp rsp r8 r9 ");
@@ -2224,7 +2356,7 @@ static kdb_cpu_cmd_t kdb_usgf_btp(void)
     kdbxp("      will print rax, rbx, *(long *)0x20ef5a5, r9 and continue\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_btp(int argc, const char **argv, struct pt_regs *regs)
 {
     int i, btpidx, numrd, argsidx, regoffs = -1;
@@ -2243,7 +2375,7 @@ kdb_cmdf_btp(int argc, const char **argv, struct pt_regs *regs)
     if ( pid == -1 )
         pid = current->pid;
 
-    gpid = (vp = kdb_pid_to_vcpu(pid, 0)) ? pid : 0;
+    gpid = (vp = kdbx_pid_to_vcpu(pid, 0)) ? pid : 0;
 
     if ( !kdb_str2addr(argv[1], &addr, gpid) || addr == 0 ) {
         kdbxp("Invalid argument:%s\n", argv[1]);
@@ -2257,7 +2389,7 @@ kdb_cmdf_btp(int argc, const char **argv, struct pt_regs *regs)
     }
 
     numrd = sizeof(unsigned long);
-    if (kdb_read_mem(addr, (kdbbyt_t *)&tmpul, numrd, vp) != numrd) {
+    if (kdbx_read_mem(addr, (kdbbyt_t *)&tmpul, numrd, vp) != numrd) {
         kdbxp("Unable to read mem from %s (%lx)\n", argv[1], addr);
         return KDB_CPU_MAIN_KDB;
     }
@@ -2275,7 +2407,7 @@ kdb_cmdf_btp(int argc, const char **argv, struct pt_regs *regs)
         if (((regoffs=kdb_valid_reg(argv[argsidx])) == -1)  &&
             kdb_str2ulong(argv[argsidx], &memloc) &&
             (memloc < sizeof (struct pt_regs) ||
-            kdb_read_mem(memloc, (kdbbyt_t *)&tmpul, sizeof(tmpul), vp) == 0)){
+            kdbx_read_mem(memloc, (kdbbyt_t *)&tmpul, sizeof(tmpul), vp) == 0)){
 
             kdbxp("error: invalid argument: %s\n", argv[argsidx]);
             return KDB_CPU_MAIN_KDB;
@@ -2306,13 +2438,13 @@ kdb_cmdf_btp(int argc, const char **argv, struct pt_regs *regs)
  *
  *  TBD: allow to be set on particular cpu
  */
-static kdb_cpu_cmd_t kdb_usgf_wp(void)
+static kdbx_cpu_cmd_t kdb_usgf_wp(void)
 {
     kdbxp("wp [addr|sym][w|i]: display or set watchpoint. writeonly or IO\n");
     kdbxp("\tnote: watchpoint is triggered after the instruction executes\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_wp(int argc, const char **argv, struct pt_regs *regs)
 {
     kdbva_t addr;
@@ -2321,8 +2453,8 @@ kdb_cmdf_wp(int argc, const char **argv, struct pt_regs *regs)
     if (argc > 1 && *argv[1] == '?')
         return kdb_usgf_wp();
 
-    if (argc <= 1 || kdb_sys_crash) {       /* list all set watchpoints */
-        kdb_do_watchpoints(0, 0, 0);
+    if (argc <= 1 || kdbx_sys_crash) {       /* list all set watchpoints */
+        kdbx_do_watchpoints(0, 0, 0);
         return KDB_CPU_MAIN_KDB;
     }
     if (!kdb_str2addr(argv[1], &addr, 0) || addr == 0) {
@@ -2338,17 +2470,17 @@ kdb_cmdf_wp(int argc, const char **argv, struct pt_regs *regs)
             return kdb_usgf_wp();
         }
     }
-    kdb_do_watchpoints(addr, rw, len);
+    kdbx_do_watchpoints(addr, rw, len);
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_wc(void)
 {
     kdbxp("wc $num|all : clear given or all watchpoints\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_wc(int argc, const char **argv, struct pt_regs *regs)
 {
     const char *argp;
@@ -2365,7 +2497,7 @@ kdb_cmdf_wc(int argc, const char **argv, struct pt_regs *regs)
         kdbxp("Invalid wpnum: %s\n", argp);
         return KDB_CPU_MAIN_KDB;
     }
-    kdb_clear_wps(wpnum);
+    kdbx_clear_wps(wpnum);
     return KDB_CPU_MAIN_KDB;
 }
 
@@ -2386,39 +2518,54 @@ kdb_prnt_tstatus(int status)
 #endif
 
 /* Dump irq desc table */
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_dirq(void)
 {
     kdbxp("dirq : dump irq bindings\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_dirq(int argc, const char **argv, struct pt_regs *regs)
 {
     int i;
+    unsigned long sz, offs;
+    char buf[KSYM_NAME_LEN+1];
 
     /* irq_desc.handle_irq: is handle_level_irq, handle_edge_irq, 
      *                      handle_fasteoi_irq, .. 
-     *irq_desc.name: edge or fasteoi, etc.. 
+     * irq_desc.name: edge or fasteoi, etc.. 
+     *
+     * desc.handl_irq == handle_edge_irq / handle_fasteoi_irq / 
+     *     handle_fasteoi_irq/ ... but they all call handle_irq_event_percpu 
+     *     which calls desc->action->handler
      */
-    kdbxp("The idt entry is indicated by irq(cpu)# in didt cmd\n");
+    kdbxp("irq# desc vec handler(name) [thread_fn(handle_irq_event_percpu)]\n");
     for ( i = 0; i  < nr_irqs; i++ ) {           /* also for_each_irq_desc */
-        struct irq_desc *idp = irq_to_desc(i);
-        struct irqaction *ap = idp ? idp->action : NULL;
+        struct irq_desc *desc = irq_to_desc(i);
+        struct irqaction *ap = desc ? desc->action : NULL;
+        struct irq_cfg *cfg = irq_cfg(i);
 
         if ( ap == NULL )
             continue;
 
-        kdbxp("[%03d]", i);
-        if (kdb_addr_is_valid((ulong)ap->handler, 0))
-            kdb_prnt_addr2sym(0, (ulong)ap->handler, "");
-        else
-            kdbxp("%016lx", ap->handler);
-        kdbxp(" %s", ap->name);
-        if (idp->owner)
-            kdbxp(" owner-mod:%p\n", idp->owner);
+        kdbxp("[%3d] %p %3d", i, desc, (cfg ? cfg->vector : -1));
+        if (kdb_addr_is_valid((ulong)ap->handler, 0)) {
+            kallsyms_lookup((ulong)ap->handler, &sz, &offs, NULL, buf);
+            kdbxp(" %s(%s)", buf, ap->name);
+            if (ap->thread_fn) {
+                kallsyms_lookup((ulong)ap->thread_fn, &sz, &offs, NULL, buf);
+                kdbxp(" tfn:%s", buf);
+            }
+        } else
+            kdbxp(" %016lx", ap->handler);
+
+        if (desc->owner)
+            kdbxp(" owner-mod:%p", desc->owner);
         kdbxp("\n");
     }
+#ifdef CONFIG_KDBX_FOR_XEN_DOM0
+    kdbx_dump_guest_evtchn();
+#endif
     return KDB_CPU_MAIN_KDB;
 }
 
@@ -2442,12 +2589,12 @@ static void kdb_prnt_vec_irq_table(int cpu)
 }
 
 /* Dump irq desc table */
-static kdb_cpu_cmd_t kdb_usgf_dvit(void)
+static kdbx_cpu_cmd_t kdb_usgf_dvit(void)
 {
     kdbxp("dvit [cpu|all]: dump (per cpu)vector irq table\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_dvit(int argc, const char **argv, struct pt_regs *regs)
 {
     int cpu, ccpu = smp_processor_id();
@@ -2476,18 +2623,22 @@ kdb_cmdf_dvit(int argc, const char **argv, struct pt_regs *regs)
 }
 
 /* Dump timer/timers queues */
-static kdb_cpu_cmd_t kdb_usgf_dtrq(void)
+static kdbx_cpu_cmd_t kdb_usgf_trq(void)
 {
-    kdbxp("dtrq: dump timer queues on all cpus\n");
+    kdbxp("trq: dump timer queues on all cpus\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
-kdb_cmdf_dtrq(int argc, const char **argv, struct pt_regs *regs)
+static kdbx_cpu_cmd_t
+kdb_cmdf_trq(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
-        return kdb_usgf_dtrq();
+        return kdb_usgf_trq();
 
-    kdbxp("FIXME\n");
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,1,12)
+    kdbxp("Not implemented\n");
+#else
+    kdbx_dump_timer_queues();
+#endif
     return KDB_CPU_MAIN_KDB;
 }
 
@@ -2525,7 +2676,7 @@ static void kdb_print_idte(int num, struct gate_struct64 *gsp)
     /* type is always "intr" */
     kdbxp("[%03d]: %x  %x %04x:%016lx ", num, dpl, present,
           idtp->selector, addr); 
-    kdb_prnt_addr2sym(0, addr, "\n");
+    kdbx_prnt_addr2sym(0, addr, "\n");
 
     /* each idte has fp, but not all of them are wired. they all go to 
      * common_interrupt and then do_IRQ */
@@ -2534,7 +2685,7 @@ static void kdb_print_idte(int num, struct gate_struct64 *gsp)
 
     /* print high level handler */
     kdbxp("  irq_desc:%p handler:%p:", desc->handle_irq);
-    kdb_prnt_addr2sym(0, (ulong)desc->handle_irq, "\n");
+    kdbx_prnt_addr2sym(0, (ulong)desc->handle_irq, "\n");
 
     if (desc->action == NULL)
         return;
@@ -2543,17 +2694,17 @@ static void kdb_print_idte(int num, struct gate_struct64 *gsp)
     kdbxp("    device handlers: ");
     for (action = desc->action; action; action = action->next) {
         kdbxp("\t%p:", action->handler);
-        kdb_prnt_addr2sym(0, (ulong)action->handler, "\n");
+        kdbx_prnt_addr2sym(0, (ulong)action->handler, "\n");
     }
 }
 
 /* Dump 64bit idt table currently on this cpu. Intel Vol 3 section 5.14.1 */
-static kdb_cpu_cmd_t kdb_usgf_didt(void)
+static kdbx_cpu_cmd_t kdb_usgf_didt(void)
 {
     kdbxp("didt : dump IDT table on the current cpu\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_didt(int argc, const char **argv, struct pt_regs *regs)
 {
     int i;
@@ -2570,6 +2721,7 @@ kdb_cmdf_didt(int argc, const char **argv, struct pt_regs *regs)
 
     return KDB_CPU_MAIN_KDB;
 }
+
 struct gdte {             /* same for TSS and LDT */
     ulong limit0:16;
     ulong base0:24;       /* linear address base, not pa */
@@ -2632,13 +2784,13 @@ static char *kdb_ret_acctype(uint acctype)
 
 /* Display GDT table. IA-32e mode is assumed. */
 /* first display non system descriptors then display system descriptors */
-static kdb_cpu_cmd_t kdb_usgf_dgdt(void)
+static kdbx_cpu_cmd_t kdb_usgf_dgdt(void)
 {
     kdbxp("dgdt [gdt-ptr decimal-byte-size] dump GDT table on current "
          "cpu or for given vcpu\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_dgdt(int argc, const char **argv, struct pt_regs *regs)
 {
     kdbxp("MUKESH: FIXME %s\n", __func__);
@@ -2678,7 +2830,7 @@ kdb_cmdf_dgdt(int argc, const char **argv, struct pt_regs *regs)
     for (taddr = start_addr+8; taddr < end_addr;  taddr += sizeof(ulong)) {
 
         /* not all entries are mapped. do this to avoid GP even if hyp */
-        if (!kdb_read_mem(taddr, (kdbbyt_t *)&u1, sizeof(u1), 0) || !u1.gval)
+        if (!kdbx_read_mem(taddr, (kdbbyt_t *)&u1, sizeof(u1), 0) || !u1.gval)
             continue;
 
         if (u1.gval == 0xffffffffffffffff || u1.gval == 0x5555555555555555)
@@ -2703,13 +2855,13 @@ kdb_cmdf_dgdt(int argc, const char **argv, struct pt_regs *regs)
         u64 upper, addr64=0;
 
         /* not all entries are mapped. do this to avoid GP even if hyp */
-        if (kdb_read_mem(taddr, (kdbbyt_t *)&u1, sizeof(u1), 0)==0 || 
+        if (kdbx_read_mem(taddr, (kdbbyt_t *)&u1, sizeof(u1), 0)==0 || 
             u1.gval == 0 || u1.gdte.S == 1) {
             continue;
         }
         idx = (taddr - start_addr) / 8;
         taddr += sizeof(ulong);
-        if (kdb_read_mem(taddr, (kdbbyt_t *)&upper, 8, 0) == 0) {
+        if (kdbx_read_mem(taddr, (kdbbyt_t *)&upper, 8, 0) == 0) {
             kdbxp("Could not read upper 8 bytes of system desc\n");
             upper = 0;
         }
@@ -2803,13 +2955,13 @@ static void kdb_display_task_struct(struct task_struct *tp)
 }
 
 /* Display scheduler basic and extended info */
-static kdb_cpu_cmd_t kdb_usgf_ts(void)
+static kdbx_cpu_cmd_t kdb_usgf_ts(void)
 {
     kdbxp("ts [pid|tp]: task struct for given pid or task_struct ptr\n");
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_ts(int argc, const char **argv, struct pt_regs *regs)
 {
     pid_t pid;
@@ -2852,13 +3004,13 @@ static void kdb_show_threads(int show_ker, int show_usr)
 }
 
 /* Display scheduler basic and extended info */
-static kdb_cpu_cmd_t kdb_usgf_tl(void)
+static kdbx_cpu_cmd_t kdb_usgf_tl(void)
 {
     kdbxp("tl [k|u]: list of tasks. k=kernel only, u=user, def show both\n");
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_tl(int argc, const char **argv, struct pt_regs *regs)
 {
     int kernel = 0, user = 0;
@@ -2930,13 +3082,13 @@ print_cfs_rq
 #endif
 }
 
-static kdb_cpu_cmd_t kdb_usgf_runq(void)
+static kdbx_cpu_cmd_t kdb_usgf_runq(void)
 {
     kdbxp("runq [cpu]: show cpu runq\n");
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_runq(int argc, const char **argv, struct pt_regs *regs)
 {
     int tmpcpu, cpu = -1;
@@ -2959,13 +3111,13 @@ kdb_cmdf_runq(int argc, const char **argv, struct pt_regs *regs)
 }
 
 /* Display scheduler basic and extended info */
-static kdb_cpu_cmd_t kdb_usgf_sched(void)
+static kdbx_cpu_cmd_t kdb_usgf_sched(void)
 {
     kdbxp("sched: show schedular info\n");
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_sched(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
@@ -2976,7 +3128,7 @@ kdb_cmdf_sched(int argc, const char **argv, struct pt_regs *regs)
 }
 
 /* Display MMU basic and extended info */
-static kdb_cpu_cmd_t kdb_usgf_mmu(void)
+static kdbx_cpu_cmd_t kdb_usgf_mmu(void)
 {
     kdbxp("mmu: print basic MMU info\n");
     kdbxp("IRQ_STACK_SIZE: %d 0x%lx\n", IRQ_STACK_SIZE, IRQ_STACK_SIZE);
@@ -2984,7 +3136,7 @@ static kdb_cpu_cmd_t kdb_usgf_mmu(void)
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_mmu(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
@@ -3010,11 +3162,14 @@ kdb_cmdf_mmu(int argc, const char **argv, struct pt_regs *regs)
     kdbxp("PMD_PAGE_SIZE     : %016lx\n", PMD_PAGE_SIZE);
     kdbxp("PMD_PAGE_MASK     : %016lx\n", PMD_PAGE_MASK);
     kdbxp("PUD_SHIFT    : $%d\n", PUD_SHIFT);
+    kdbxp("PGDIR_SHIFT  : $%d\n", PGDIR_SHIFT);
+    kdbxp("PHYSICAL_PUD_PAGE_MASK: %016lx\n", PHYSICAL_PUD_PAGE_MASK);
     kdbxp("PUD_MASK     : %016lx\n", PUD_MASK);
     kdbxp("HPAGE_SHIFT       : %016lx\n", HPAGE_SHIFT);
     kdbxp("HPAGE_SIZE        : %016lx\n", HPAGE_SIZE);
     kdbxp("HPAGE_MASK        : %016lx\n", HPAGE_MASK);
     kdbxp("HUGETLB_PAGE_ORDER: %016lx\n", HUGETLB_PAGE_ORDER);
+    kdbxp("KVM_PFN_ERR_FAULT : %016lx\n", KVM_PFN_ERR_FAULT);
     kdbxp("\n");
     kdbxp("__KERNEL_CS    : %x\n", __KERNEL_CS);
     kdbxp("__KERNEL_DS/SS : %x\n", __KERNEL_DS);
@@ -3029,13 +3184,13 @@ kdb_cmdf_mmu(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t kdb_usgf_iommu(void)
+static kdbx_cpu_cmd_t kdb_usgf_iommu(void)
 {
     kdbxp("dump iommu p2m table for all domains\n");
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_iommu(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
@@ -3172,12 +3327,12 @@ static void kdb_display_page_flags(ulong flags)
 }
 
 /* print struct page_info{} given ptr to it or an mfn */
-static kdb_cpu_cmd_t kdb_usgf_dpage(void)
+static kdbx_cpu_cmd_t kdb_usgf_dpage(void)
 {
     kdbxp("dpage pfn|page-ptr : Display struct page\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_dpage(int argc, const char **argv, struct pt_regs *regs)
 {
     unsigned long val;
@@ -3235,13 +3390,42 @@ kdb_cmdf_dpage(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
+static kdbx_cpu_cmd_t kdb_usgf_wpt(void)
+{
+    kdbxp("wpt addr [pid]: walk kernel page table\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_wpt(int argc, const char **argv, struct pt_regs *regs)
+{
+    unsigned long addr;
+    pid_t gpid = 0;
+    struct kvm_vcpu *vp = NULL;
+
+    if (argc <= 1 || *argv[1] == '?') 
+        return kdb_usgf_wpt();
+
+    if ((kdb_str2ulong(argv[1], &addr) == 0)) {
+        kdbxp("Invalid arg:%s\n", argv[1]);
+        return KDB_CPU_MAIN_KDB;
+    }
+    if (argc >= 3 ) {
+        if ( kdb_str2pid(argv[2], &gpid, 1)==0 || 
+             (vp = kdbx_pid_to_vcpu(gpid, 1))==0 )
+            return KDB_CPU_MAIN_KDB;
+    }
+
+    kdbx_walk_pt(addr, vp);  /* kdbx_mem_rw.c */
+    return KDB_CPU_MAIN_KDB;
+}
+
 /* display asked msr value */
-static kdb_cpu_cmd_t kdb_usgf_dmsr(void)
+static kdbx_cpu_cmd_t kdb_usgf_dmsr(void)
 {
     kdbxp("dmsr address : Display msr value\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_dmsr(int argc, const char **argv, struct pt_regs *regs)
 {
     unsigned long addr, val;
@@ -3260,12 +3444,12 @@ kdb_cmdf_dmsr(int argc, const char **argv, struct pt_regs *regs)
 }
 
 /* execute cpuid for given value */
-static kdb_cpu_cmd_t kdb_usgf_cpuid(void)
+static kdbx_cpu_cmd_t kdb_usgf_cpuid(void)
 {
     kdbxp("cpuid eax : Display cpuid value returned in rax\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_cpuid(int argc, const char **argv, struct pt_regs *regs)
 {
     unsigned int ax=0, bx=0, cx=0, dx=0;
@@ -3293,49 +3477,75 @@ kdb_cmdf_cpuid(int argc, const char **argv, struct pt_regs *regs)
 }
 
 /* Save symbols info for a guest */
-static kdb_cpu_cmd_t kdb_usgf_sym(void)
+static kdbx_cpu_cmd_t kdb_usgf_sym(void)
 {
-   kdbxp("sym gpid &kallsyms_names &kallsyms_addresses &kallsyms_num_syms\n");
-   kdbxp("\t [&kallsyms_token_table] [&kallsyms_token_index]\n");
-   kdbxp("\ttoken _table and _index MUST be specified for el5\n");
-   kdbxp("\tgpid : any guest pid (not tgid)\n");
+   kdbxp(">>> MAKE sure guest is booted with nokaslr\n");
+   kdbxp("sym gpid &kallsyms_names &kallsyms_num_syms &kallsyms_relative_base\n");
+   kdbxp(" &kallsyms_offsets (ol7 default) OR\n");
+   kdbxp("sym gpid &kallsyms_names &kallsyms_num_syms &kallsyms_addresses\n");
+   kdbxp("\t[&kallsyms_token_table] [&kallsyms_token_index]\n");
+   kdbxp("\ttoken _table and _index MUST be specified for el5 and above\n");
+   kdbxp("\tgpid : any guest pid/lwp/tid. (not tgid)\n");
 
    return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_sym(int argc, const char **argv, struct pt_regs *regs)
 {
-    ulong namesp, addrap, nump, toktblp, tokidxp;
+    ulong namesp, nump, addrap, relbase, offsets, toktblp, tokidxp;
     pid_t gpid;
 
-    if (argc < 5) {
+    namesp = nump = addrap = relbase = offsets = toktblp = tokidxp = 0;
+
+    /* [el4 == 5]  [el5 and el6 == 7]  [el7 == 8] */  
+    if (argc != 5 && argc != 7 && argc != 8) {
         return kdb_usgf_sym();
     }
-    toktblp = tokidxp = 0;     /* optional parameters */
+
+    /* common args */
     if (kdb_str2pid(argv[1], &gpid, 1)    &&
-        kdb_pid_to_vcpu(gpid, 1)          &&
+        kdbx_pid_to_vcpu(gpid, 1)         &&
         kdb_str2ulong(argv[2], &namesp)   &&
-        kdb_str2ulong(argv[3], &addrap)   &&
-        kdb_str2ulong(argv[4], &nump)     && 
-        (argc==5 || (argc==7 && kdb_str2ulong(argv[5], &toktblp) &&
-                                kdb_str2ulong(argv[6], &tokidxp)))) {
+        kdb_str2ulong(argv[3], &nump))
+            ;
+    else
+        return kdb_usgf_sym();
 
-        kdb_sav_guest_syminfo(gpid, namesp, addrap, nump, toktblp, tokidxp);
-    } else
-        kdb_usgf_sym();
+    if (argc == 5 && kdb_str2ulong(argv[4], &addrap))
+        ;   /* all good for el4 */
+    else if (argc == 7 &&
+        kdb_str2ulong(argv[4], &addrap)   &&
+        kdb_str2ulong(argv[5], &toktblp)  && 
+        kdb_str2ulong(argv[6], &tokidxp)) 
+            ;   /* all good for el5 and el6 */
+    else if (argc == 8 &&
+        kdb_str2ulong(argv[4], &relbase)  &&
+        kdb_str2ulong(argv[5], &offsets)  &&
+        kdb_str2ulong(argv[6], &toktblp)  && 
+        kdb_str2ulong(argv[7], &tokidxp)) 
+            ;   /* all good for el7 */
+    else
+        return kdb_usgf_sym();
 
+    kdbxp("gpid:%d namesp:%lx nump:%lx addrs:%lx relbase:%lx offsets:%lx\n",
+          gpid, namesp, nump, addrap, relbase, offsets);
+    kdbxp("toktblp:%lx tokidxp:%lx\n", toktblp, tokidxp);
+         
+    kdbxp(">>> MAKE sure guest is booted with nokaslr\n");
+    kdbx_sav_guest_syminfo(gpid, namesp, nump, addrap, relbase, offsets, 
+                           toktblp, tokidxp);
     return KDB_CPU_MAIN_KDB;
 }
 
 /* Display modules loaded in linux guest */
-static kdb_cpu_cmd_t kdb_usgf_mods(void)
+static kdbx_cpu_cmd_t kdb_usgf_mods(void)
 {
    kdbxp("mods : display all loaded modules\n");
    return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_mods(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
@@ -3360,8 +3570,10 @@ static ulong kdbx_ept_walk_table(struct kvm_vcpu *vp, ulong gfn, int pr_info)
         kdbxp("EPT ptr mfn is invalid: %lx\n", eptmfn);
         return 0;
     }
-    if ( !kdb_gfn_valid(vp, gfn, 1) )
+    if ( !kdb_gfn_valid(vp, gfn, 1) ) {
+        KDBGP("wept: gfn:%lx is invalid\n", gfn);
         return 0;
+    }
 
     pg = pfn_to_page(eptmfn);
     eptpg = kmap(pg);
@@ -3422,12 +3634,12 @@ static ulong kdbx_ept_walk_table(struct kvm_vcpu *vp, ulong gfn, int pr_info)
     return mfn;
 }
 
-static kdb_cpu_cmd_t kdb_usgf_wept(void)
+static kdbx_cpu_cmd_t kdb_usgf_wept(void)
 {
     kdbxp("wept pid/vcpu gfn: walk ept table for given pid and gfn\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_wept(int argc, const char **argv, struct pt_regs *regs)
 {
     struct kvm_vcpu *v;
@@ -3444,30 +3656,61 @@ kdb_cmdf_wept(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
-ulong kdb_p2m(ulong gfn, struct kvm_vcpu *vp)
+ulong kdbx_p2m(struct kvm_vcpu *vp, ulong gfn)
 {
-    if ( vp )
-        return kdbx_ept_walk_table(vp, gfn, 0);
+    ulong mfn;
 
+    KDBGP1("p2m: vp:%p gfn:%lx\n", vp, gfn);
+    if ( vp ) {
+        if ( (mfn=kdbx_ept_walk_table(vp, gfn, 0)) == 0 ) {
+            /* bad things will happen if gfn is not valid */
+            struct kvm *kp = vp->kvm;
+            struct kvm_memslots *slots = kvm_memslots(kp);
+
+            if ( search_memslots(slots, gfn) ) {
+                struct task_struct *savcur = current;
+                struct task_struct *tp = pid_task(vp->pid, PIDTYPE_PID);
+
+                if (tp == NULL) {
+                    kdbxp("p2m: invalid task struct:%p\n", tp);
+                    return 0;
+                }
+
+                /* gfn_to_pfn_atomic will use current to walk the user hva
+                 * memory lookups, so will panic if current is not VM pid */
+                __this_cpu_write(current_task, tp);
+                mfn = gfn_to_pfn_atomic(kp, gfn);
+                __this_cpu_write(current_task, savcur);
+                if ( mfn == KVM_PFN_ERR_FAULT ) {
+                    kdbxp("gfn_to_pfn: ret KVM_PFN_ERR_FAULT:%lx gfn:%lx\n",
+                          KVM_PFN_ERR_FAULT, gfn);
+                    mfn = 0;
+                }
+            }
+        }
+        KDBGP1("p2m ret: for gfn:%lx mfn:%lx\n", gfn, mfn);
+        return mfn;
+    }
     return gfn;   /* host: gfn is pfn */
 }
+EXPORT_SYMBOL_GPL(kdbx_p2m);
 
-static kdb_cpu_cmd_t kdb_usgf_p2m(void)
+static kdbx_cpu_cmd_t kdb_usgf_p2m(void)
 {
     kdbxp("p2m pid/vcpu gfn: print pfn, ie, mfn for the gfn, ie, pfn\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_p2m(int argc, const char **argv, struct pt_regs *regs)
 {
-    struct kvm_vcpu *v;
+    struct kvm_vcpu *vp;
     ulong gfn, pfn;
 
     if ((argc > 1 && *argv[1] == '?') || argc != 3)
         return kdb_usgf_p2m();
 
-    if ( (v=kdb_pidvcpustr2vcpu(argv[1], 0)) && kdb_str2ulong(argv[2], &gfn) ) {
-        pfn = kdbx_ept_walk_table(v, gfn, 0);
+    if ( (vp=kdb_pidvcpustr2vcpu(argv[1], 0)) && kdb_str2ulong(argv[2], &gfn) ){
+        pfn = kdbx_p2m(vp, gfn);
         kdbxp("gfn: %016lx  pfn:%016lx\n", gfn, pfn);
     } else
         kdb_usgf_p2m();
@@ -3476,13 +3719,13 @@ kdb_cmdf_p2m(int argc, const char **argv, struct pt_regs *regs)
 }
 
 /* Display VMCS or VMCB */
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_usgf_dvmc(void)
 {
     kdbxp("dvmc [pid/vcpu]: Dump vmcs/vmcb\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_dvmc(int argc, const char **argv, struct pt_regs *regs)
 {
     struct kvm_vcpu *vp = NULL;
@@ -3541,8 +3784,8 @@ static void kdb_display_varch(struct kvm_vcpu *vp)
     kdbxp("  cr4:%016lx cr4-guest:%016lx\n", ap->cr4, ap->cr4_guest_owned_bits);
     kdbxp("  cr2:%016lx cr3:%016lx cr8::%016lx\n", ap->cr2, ap->cr3, ap->cr8);
 
-    kdb_vcpu_to_ptregs(vp, &regs);
-    kdb_print_regs(&regs);
+    kdbx_vcpu_to_ptregs(vp, &regs);
+    kdbx_print_regs(&regs);
 
     kdbxp("  hflags:%08x efer:%016lx mp_state:%08x tpr_acc:%d\n", ap->hflags,
           ap->efer, ap->mp_state, !!ap->tpr_access_reporting);
@@ -3558,13 +3801,13 @@ static void kdb_display_varch(struct kvm_vcpu *vp)
     kdb_display_kvm_mmu(ap);
 }
 
-static kdb_cpu_cmd_t kdb_usgf_varch(void)
+static kdbx_cpu_cmd_t kdb_usgf_varch(void)
 {
     kdbxp("varch [*vcpu*-ptr] : display current/vcpu-ptr vcpu arch info\n");
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_varch(int argc, const char **argv, struct pt_regs *regs)
 {
     struct kvm_vcpu *v = NULL;
@@ -3589,7 +3832,7 @@ static void kdb_display_vcpu(struct kvm_vcpu *vp)
         return;
 
     tp = pid_task(vp->pid, PIDTYPE_PID);
-    kdbxp("vcpu: %p  vcpu_id:%d kvm:%p pid:%d(??) tgid:%d??\n", vp,vp->vcpu_id,
+    kdbxp("vcpu: %p  vcpu_id:%d kvm:%p pid:%d(?) lwp:%d\n", vp,vp->vcpu_id,
           vp->kvm, vp->preempted, tp ? tp->pid : -1, tp ? tp->tgid : -1);
 
     kdbxp("\tcpu:%d srcu_idx:%d mode:%d requests:%d", vp->cpu, vp->srcu_idx,
@@ -3606,7 +3849,7 @@ static void kdb_display_vcpu(struct kvm_vcpu *vp)
           vp->mmio_nr_fragments, vp->mmio_fragments);
 #endif
 #ifdef CONFIG_KVM_ASYNC_PF
-    kdbxp("\tasync_pf:%p\n", &vp->async_pf);
+    kdbxp("\tasync_pf:%p", &vp->async_pf);
 #endif
 #ifdef CONFIG_HAVE_KVM_CPU_RELAX_INTERCEPT
     kdbxp("\tspin_loop:%p\n", &vp->spin_loop);
@@ -3616,12 +3859,12 @@ static void kdb_display_vcpu(struct kvm_vcpu *vp)
     kdbx_display_vvmx(vp);
 }
 
-static kdb_cpu_cmd_t kdb_usgf_vcpu(void)
+static kdbx_cpu_cmd_t kdb_usgf_vcpu(void)
 {
     kdbxp("vcpu [pid/vcpu-ptr] : display current/vcpu-ptr vcpu info\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t 
+static kdbx_cpu_cmd_t 
 kdb_cmdf_vcpu(int argc, const char **argv, struct pt_regs *regs)
 {
     struct kvm_vcpu *vp;
@@ -3642,6 +3885,133 @@ kdb_cmdf_vcpu(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
+void kdbx_disp_virtio_device(struct virtio_device *vdevp, int prshort)
+{
+    struct device *dev;          /* include/linux/device.h */
+
+    kdbxp("  idx(on virt bus): %d  virtio_device_id:%d\n", vdevp->index,
+          vdevp->id);
+    dev = &vdevp->dev;
+    kdbxp("  device{}: name:%s  bus_type:{%s %s} dd:{%s mod:%s}\n",
+          dev->type->name, dev->bus->name, dev->bus->dev_name,
+          dev->driver->name, dev->driver->mod_name);
+    
+    if (prshort)
+        return;
+    /* long info, dump more */
+}
+
+static void kdbx_disp_virtq(struct virtqueue *vq, int prshort)
+{
+    char buf[KSYM_NAME_LEN];
+
+    kdbxp("callback: %s name: %s virtio_device (%p):\n",
+          kdbx_addr2sym(0, (kdbva_t)vq->callback, buf, 0), 
+          vq->name, vq->vdev);
+    kdbx_disp_virtio_device(vq->vdev, 1);
+
+    if (prshort)
+        return;
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_virtq(void)
+{
+    kdbxp("virtq addr: dump virtqueue struct\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_virtq(int argc, const char **argv, struct pt_regs *regs)
+{
+    struct virtqueue *vq;
+
+    if ( argc < 2 || *argv[1] == '?' )
+        return kdb_usgf_virtq();
+
+    if (!kdb_str2addr(argv[1], (kdbva_t *)&vq, 0)) {
+        kdbxp("Invalid addr: %lx\n", vq);
+        return KDB_CPU_MAIN_KDB;
+    }
+    kdbx_disp_virtq(vq, 1);
+
+    return KDB_CPU_MAIN_KDB;
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_virtscsi(void)
+{
+    kdbxp("virtscsi addr: dump virtio_scsi struct\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_virtscsi(int argc, const char **argv, struct pt_regs *regs)
+{
+    struct virtio_scsi;
+    extern void kdbx_disp_virtio_scsi(struct virtio_scsi *);
+    struct virtio_scsi *vs;
+
+    if ( argc < 2 || *argv[1] == '?' )
+        return kdb_usgf_virtscsi();
+
+    if (!kdb_str2addr(argv[1], (kdbva_t *)&vs, 0)) {
+        kdbxp("Invalid addr: %lx\n", vs);
+        return KDB_CPU_MAIN_KDB;
+    }
+    kdbx_disp_virtio_scsi(vs);  /* will call above kdbx_disp_virtio_device() */
+    return KDB_CPU_MAIN_KDB;
+}
+
+static void kdbx_disp_bus_details(char *busnm, struct kvm_io_bus *iobus)
+{
+    int i;
+    char buf[KSYM_NAME_LEN+16];
+    struct kvm_io_range *ior;
+
+    kdbxp("  %s: ioeventfd_count:%d dev_count:%d\n", 
+          busnm, iobus->ioeventfd_count, iobus->dev_count);
+
+    ior = iobus->range;
+    for (i=0; i < iobus->dev_count; i++, ior++) {
+        if ( ior->len == 0 )
+            continue;
+        kdbxp("      addr:%lx len:%d dev: {%s %s %s}\n",
+              ior->addr, ior->len,
+              kdbx_addr2sym(0, (kdbva_t)ior->dev->ops->read, buf, 0), 
+              kdbx_addr2sym(0, (kdbva_t)ior->dev->ops->write, buf, 0), 
+              kdbx_addr2sym(0, (kdbva_t)ior->dev->ops->destructor, buf, 0)); 
+    }
+}
+
+/* include/linux/kvm_host.h: struct kvm_io_bus __rcu *buses[KVM_NR_BUSES] */
+static void kvm_display_io_bus(struct kvm *kp)
+{
+    kdbxp("\n");
+    kdbx_disp_bus_details("KVM_MMIO_BUS", kp->buses[KVM_MMIO_BUS]);
+    kdbx_disp_bus_details("KVM_PIO_BUS", kp->buses[KVM_PIO_BUS]);
+    kdbx_disp_bus_details("KVM_VIRTIO_CCW_NOTIFY_BUS", 
+                           kp->buses[KVM_VIRTIO_CCW_NOTIFY_BUS]);
+    kdbx_disp_bus_details("KVM_FAST_MMIO_BUS", kp->buses[KVM_FAST_MMIO_BUS]);
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_vmiodevs(void)
+{
+    kdbxp("vmiodevs skvm-ptr: list io buses/devices for a VM\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_vmiodevs(int argc, const char **argv, struct pt_regs *regs)
+{
+    struct kvm *kp = NULL;
+
+    if ((argc != 2) || (argc > 1 && *argv[1] == '?') )
+        return kdb_usgf_vmiodevs();
+
+    if ( (kp = kdbx_str2skvm(argv[1], 1)) == NULL )
+        return kdb_usgf_vmiodevs();
+
+    kvm_disp_ioeventfds(kp);     /* virt/kvm/eventfd.c */
+    kvm_display_io_bus(kp);
+
+    return KDB_CPU_MAIN_KDB;
+}
 
 static void kdb_display_kvm_struct(struct kvm *kp)
 {
@@ -3651,26 +4021,16 @@ static void kdb_display_kvm_struct(struct kvm *kp)
     struct kvm_vcpu *vp;
     struct task_struct *tp;
 
-    kdbxp("struct kvm %p:  online_vcpus:%d  last_boosted:%d\n", 
+    kdbxp("struct kvm %p:  online_vcpus:%d  last_boosted:%d  VCPUs:\n", 
           kp, kp->online_vcpus.counter, kp->last_boosted_vcpu);
 
-    vp = kp->vcpus[0];
-    tp = vp ? pid_task(vp->pid, PIDTYPE_PID) : 0;
-    if ( vp )
-        kdbxp("  vcpus: %p  vcpu_id: %d  pid:%d  tgid:%d\n", vp, vp->vcpu_id, 
-              tp ? tp->pid : -1, tp ? tp->tgid : -1);
-
-    for (i = 1; i < KVM_MAX_VCPUS; i++) {
+    for (i = 0; i < KVM_MAX_VCPUS; i++) {
         if ( (vp = kp->vcpus[i]) == NULL )
             continue;
 
         tp = pid_task(vp->pid, PIDTYPE_PID);
         kdbxp("         %p  vcpu_id: %d  pid:%d  tgid:%d\n", vp, vp->vcpu_id, 
               tp ? tp->pid : -1, tp ? tp->tgid : -1);
-
-        // if ( i % 3 == 0 ) kdbxp("\t");
-        // kdbxp("\t%p ", kp->vcpus[i]);
-        // if ( ++i % 3 == 0 ) kdbxp("\n");
     }
     kdbxp("\n");
     kdbxp("  users_count: %d &kvm_vm_stat:%p\n", kp->users_count, &kp->stat);
@@ -3692,7 +4052,7 @@ static void kdb_display_kvm_struct(struct kvm *kp)
     kdbxp("  memslots: %p generation:%x\n", km->memslots[0], km->generation);
     #define fs "    "
     for (i=0; i < KVM_MEM_SLOTS_NUM; i++) {
-        struct kvm_memory_slot *ks = km->memslots;
+        struct kvm_memory_slot *ks = &km->memslots[i];
 
         if (ks->npages == 0)
             continue;
@@ -3703,72 +4063,87 @@ static void kdb_display_kvm_struct(struct kvm *kp)
     #undef fs
 }
 
-/* struct kvm in include/linux/kvm_host.h */
-static void kdb_display_kvm(struct kvm *arg)
+static kdbx_cpu_cmd_t kdb_usgf_skvm(void)
 {
-    extern struct list_head vm_list;
-
-    struct list_head *lp;
-
-    list_for_each(lp, &vm_list) {
-        struct kvm *kp = list_entry(lp, struct kvm, vm_list); /* container of*/
-        kdb_display_kvm_struct(kp);
-        kdbxp("\n");
-#if 0
-    int count = 0;
-        if (arg) {
-            if (arg == kp || arg == (void *)-1) {
-                kdb_display_kvm_struct(kp);
-                return;
-            }
-            continue;
-        }
-        if ( count % 3 == 0 ) kdbxp("\t");
-        kdbxp(" %p", kp);
-        if ( ++count % 3 == 0 ) kdbxp("\n");
-#endif
-    }
-    kdbxp("\n");
-}
-
-static kdb_cpu_cmd_t kdb_usgf_skvm(void)
-{
-    kdbxp("skvm [all|kvm-ptr]: kvm structs\n");
+    kdbxp("skvm [ptr]: one or all kvm structs\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_skvm(int argc, const char **argv, struct pt_regs *regs)
 {
-    struct kvm *kp = NULL;
+    extern struct list_head vm_list;
+    struct list_head *lp;
+    struct kvm *argkp = NULL;   /* struct kvm in include/linux/kvm_host.h */
 
     if (argc > 1 && *argv[1] == '?')
         return kdb_usgf_skvm();
 
     if ( argc > 1 ) {
-
-    /* for now show everything */
-#if 0
-        if (strcmp(argv[1], "all") == 0)
-            kp = (void *)-1;
-
-        else if ((kdb_str2ulong(argv[1], (ulong *)&kp) == 0)) {
-            kdbxp("invalid kvm ptr %s\n", argv[1]);
-            return KDB_CPU_MAIN_KDB;
-        }
-#endif
+        if ( (argkp = kdbx_str2skvm(argv[1], 1)) == NULL )
+            return kdb_usgf_skvm();
     }
-    kdb_display_kvm(kp);
+    list_for_each(lp, &vm_list) {
+        struct kvm *kp = list_entry(lp, struct kvm, vm_list); /* container of*/
+
+        KDBGP1("argkp:%p kp:%p\n", argkp, kp);
+        if (argkp == NULL || argkp == kp)
+            kdb_display_kvm_struct(kp);
+
+        kdbxp("\n");
+    }
+    return KDB_CPU_MAIN_KDB;
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_vms(void)
+{
+    kdbxp("vms: list all VMs\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_vms(int argc, const char **argv, struct pt_regs *regs)
+{
+    struct kvm_vcpu *vp;
+    extern struct list_head vm_list;
+    struct list_head *lp;
+    struct task_struct *tp;
+    kdbva_t addr;
+    char buf[KSYM_NAME_LEN+16];  /* extra for pid: */
+    pid_t pid;
+    int i;
+
+    if (argc > 1 && *argv[1] == '?')
+        return kdb_usgf_vms();
+
+    kdbxp("vp tgid vcpu-id state(0==KVM_MP_STATE_RUNNABLE) pid:RIP\n");
+    list_for_each(lp, &vm_list) {
+        struct kvm *kp = list_entry(lp, struct kvm, vm_list); /* container of*/
+
+        kdbxp("struct kvm: %p cpus:{created:%d online:%d}\n", kp, 
+              kp->created_vcpus, kp->online_vcpus);
+
+        for (i=0; i < KVM_MAX_VCPUS; i++) {
+            if ( (vp = kp->vcpus[i]) == NULL )
+                continue;
+
+            tp = pid_task(vp->pid, PIDTYPE_PID);
+            pid = tp ? tp->pid : -1;
+            addr = (kdbva_t)vp->arch.regs[VCPU_REGS_RIP];
+            kdbxp(" %lx %d %d %d %s\n", vp, tp->tgid, vp->vcpu_id,
+                  vp->arch.mp_state, kdbx_addr2sym(pid, addr, buf, 0));
+        }
+        kdbxp("\n");
+    }
     return KDB_CPU_MAIN_KDB;
 }
 
 /* toggle kdb debug trace level */
-static kdb_cpu_cmd_t kdb_usgf_kdbdbg(void)
+static kdbx_cpu_cmd_t kdb_usgf_kdbdbg(void)
 {
     kdbxp("kdbdbg : trace info to debug kdb\n");
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_kdbdbg(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
@@ -3779,12 +4154,12 @@ kdb_cmdf_kdbdbg(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t kdb_usgf_reboot(void)
+static kdbx_cpu_cmd_t kdb_usgf_reboot(void)
 {
     kdbxp("reboot: reboot system\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_reboot(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
@@ -3795,76 +4170,76 @@ kdb_cmdf_reboot(int argc, const char **argv, struct pt_regs *regs)
 }
 
 
-static kdb_cpu_cmd_t kdb_usgf_trcon(void)
+static kdbx_cpu_cmd_t kdb_usgf_trcon(void)
 {
     kdbxp("trcon: turn user added kdb tracing on\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_trcon(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
         return kdb_usgf_trcon();
 
-    kdb_trcon = 1;
+    kdbx_trcon = 1;
     kdbxp("kdb tracing is now on\n");
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t kdb_usgf_trcoff(void)
+static kdbx_cpu_cmd_t kdb_usgf_trcoff(void)
 {
     kdbxp("trcoff: turn user added kdb tracing off\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_trcoff(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
         return kdb_usgf_trcoff();
 
-    kdb_trcon = 0;
+    kdbx_trcon = 0;
     kdbxp("kdb tracing is now off\n");
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t kdb_usgf_trcz(void)
+static kdbx_cpu_cmd_t kdb_usgf_trcz(void)
 {
     kdbxp("trcz : zero entire trace buffer\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_trcz(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
         return kdb_usgf_trcz();
 
-    kdb_trczero();
+    kdbx_trczero();
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t kdb_usgf_trcp(void)
+static kdbx_cpu_cmd_t kdb_usgf_trcp(void)
 {
     kdbxp("trcp : give hints to dump trace buffer via dw/dd command\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_trcp(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
         return kdb_usgf_trcp();
 
-    kdb_trcp();
+    kdbx_trcp();
     return KDB_CPU_MAIN_KDB;
 }
 
 /* print some basic info, constants, etc.. */
-static kdb_cpu_cmd_t kdb_usgf_ioctls(void)
+static kdbx_cpu_cmd_t kdb_usgf_ioctls(void)
 {
     kdbxp("ioctls : display kvm ioctl values..\n");
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_ioctls(int argc, const char **argv, struct pt_regs *regs)
 {
     if (argc > 1 && *argv[1] == '?')
@@ -3903,6 +4278,25 @@ kdb_cmdf_ioctls(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
+static void kdb_show_sched_info(void)
+{
+    kdbxp("PREEMPT_NEED_RESCHED: %08x\n", PREEMPT_NEED_RESCHED);
+    kdbxp("PREEMPT_ENABLED: %08x\n", PREEMPT_ENABLED);
+    kdbxp("PREEMPT_DISABLED: %08x\n", PREEMPT_DISABLED);
+
+    kdbxp("PREEMPT_MASK: %08x\n", PREEMPT_MASK);
+    kdbxp("SOFTIRQ_MASK: %08x\n", SOFTIRQ_MASK);
+    kdbxp("HARDIRQ_MASK: %08x\n", HARDIRQ_MASK);
+    kdbxp("NMI_MASK: %08x\n", NMI_MASK);
+
+    kdbxp("PREEMPT_OFFSET: %08x\n", PREEMPT_OFFSET);
+    kdbxp("SOFTIRQ_OFFSET: %08x\n", SOFTIRQ_OFFSET);
+    kdbxp("HARDIRQ_OFFSET: %08x\n", HARDIRQ_OFFSET);
+    kdbxp("NMI_OFFSET: %08x\n", NMI_OFFSET);
+    kdbxp("SOFTIRQ_DISABLE_OFFSET: %08x\n", SOFTIRQ_DISABLE_OFFSET);
+
+}
+
 static void kdb_show_cpu_masks(void)
 {
     int cpu;
@@ -3927,12 +4321,12 @@ static void kdb_show_cpu_masks(void)
 }
 
 /* print some basic info, constants, etc.. */
-static kdb_cpu_cmd_t kdb_usgf_info(void)
+static kdbx_cpu_cmd_t kdb_usgf_info(void)
 {
     kdbxp("info : display basic info, constants, etc..\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_info(int argc, const char **argv, struct pt_regs *regs)
 {
     extern struct boot_params boot_params;
@@ -3967,29 +4361,35 @@ kdb_cmdf_info(int argc, const char **argv, struct pt_regs *regs)
     kdbxp("_sinittext: "KDBFL"\t_einittext: "KDBFL"\n", _sinittext, _einittext);
 
     kdb_show_cpu_masks();
+    kdb_show_sched_info();
 
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t kdb_usgf_cur(void)
+static kdbx_cpu_cmd_t kdb_usgf_cur(void)
 {
     kdbxp("cur: display current info\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_cur(int argc, const char **argv, struct pt_regs *regs)
 {
     struct vmcs *vmcsp, *vmxap;
-    int guest_mode = kdb_guest_mode(regs);
-    struct kvm_vcpu *vp = kdb_pid_to_vcpu(current->pid, 0);
+    int guest_mode = kdbx_guest_mode(regs);
+    struct kvm_vcpu *vp = kdbx_pid_to_vcpu(current->pid, 0);
 
     if (argc > 1 && *argv[1] == '?')
         return kdb_usgf_cur();
 
-    kdbxp("[%c]current(ts):%p  pid:%d  %s  numthr:%d\n",
-          guest_mode ? 'G' : 'H',
-          current, current->pid, current->comm, get_nr_threads(current));
+    kdbxp("[%c]current(ts):%p  pid:%d  %s  numthr:%d preempt_cnt:%x\n",
+          guest_mode ? 'G' : 'H', current, current->pid, 
+          current->comm, get_nr_threads(current),
+          raw_cpu_read_4(__preempt_count));
+#if 0
+    kdbxp("   in_irq:%x softirq:%x intrupt:%x softsrv:%x in_task:%x\n",
+          in_irq(), in_softirq(), in_interrupt(), in_softirq(), in_task());
 
+#endif
     if ( vp ) {
         kdbx_ret_curr_vcpu_info(&vp, &vmcsp, &vmxap);
         kdbxp("vcpu: %p vmcs: %p vmxa: %p\n", vp, vmcsp, vmxap);
@@ -3997,12 +4397,80 @@ kdb_cmdf_cur(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t kdb_usgf_bio(void)
+#define KDBX_MAX_VHOST_SAV 256
+struct kdbx_vhostdevs_sav {
+    struct vhost_dev *vhdev;
+    char *dev_type;  /* char * : vhost_scsi, vsock, net, test */
+};
+struct kdbx_vhostdevs_sav vhost_devs[KDBX_MAX_VHOST_SAV];
+void kdbx_sav_vhost_dev(struct vhost_dev *dev, char *type)
+{
+    int i;
+
+    for (i=0; i < KDBX_MAX_VHOST_SAV; i++) {
+        struct kdbx_vhostdevs_sav *p = &vhost_devs[i];
+
+        if (p->vhdev == NULL) {
+            p->vhdev = dev;
+            p->dev_type = type;
+            break;
+        }
+    }
+    if ( i >= KDBX_MAX_VHOST_SAV )
+        kdbxp(">>>>>>>>> vhost_devs array FULL!!!|\n");
+}
+EXPORT_SYMBOL_GPL(kdbx_sav_vhost_dev);
+
+static kdbx_cpu_cmd_t kdb_usgf_vhostdevs(void)
+{
+    kdbxp("vhostdevs: list all vhost devices\n");
+    kdbxp("  make sure: vhost net/scsi mods compiled with kdbx\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_vhostdevs(int argc, const char **argv, struct pt_regs *regs)
+{
+    int i;
+
+    if ( (argc > 1 && *argv[1] == '?') )
+        return kdb_usgf_vhostdevs();
+
+    kdbxp("  (make sure: vhost net/scsi mods compiled with kdbx)\n");
+    for (i=0; i < KDBX_MAX_VHOST_SAV; i++) {
+        struct kdbx_vhostdevs_sav *p = &vhost_devs[i];
+
+        if (p->vhdev == NULL)
+            continue;
+        kdbxp("dev:%p type:%s worker:(%d)%s\n", p->vhdev, p->dev_type,
+              p->vhdev->worker->pid, p->vhdev->worker->comm);
+    }
+    return KDB_CPU_MAIN_KDB;
+}
+
+#if 0
+static kdbx_cpu_cmd_t kdb_usgf_devices(void)
+{
+    kdbxp("devices: list all devices\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_devices(int argc, const char **argv, struct pt_regs *regs)
+{
+    // struct device *dev;  /* include/linux/device.h */
+    if ( (argc > 1 && *argv[1] == '?') )
+        return kdb_usgf_devices();
+
+    kdbxp("kdbx: just browse thru /sys for all devices\n");
+    return KDB_CPU_MAIN_KDB;
+}
+#endif
+
+static kdbx_cpu_cmd_t kdb_usgf_bio(void)
 {
     kdbxp("bio addr: display struct bio (include/linux/blk_types.h)\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_bio(int argc, const char **argv, struct pt_regs *regs)
 {
     struct bio *bp;   /* include/linux/blk_types.h */
@@ -4048,18 +4516,18 @@ kdb_cmdf_bio(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t kdb_usgf_reqq(void)
+static kdbx_cpu_cmd_t kdb_usgf_reqq(void)
 {
     kdbxp("reqq addr: display struct request_queue for block device\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_reqq(int argc, const char **argv, struct pt_regs *regs)
 {
     struct request_queue *rq;      /* include/linux/blkdev.h */
     char *bd_name;
 
-    if (argc > 1 && *argv[1] == '?')
+    if (argc < 2 || *argv[1] == '?')
         return kdb_usgf_reqq();
 
     if (!kdb_str2addr(argv[1], (kdbva_t *)&rq, 0)) {
@@ -4068,13 +4536,13 @@ kdb_cmdf_reqq(int argc, const char **argv, struct pt_regs *regs)
     }
     kdbxp("request queue: %p\n", rq);
     kdbxp("  request_fn: %s  ");
-    kdb_prnt_addr2sym(0, (ulong)rq->request_fn, "\n");
+    kdbx_prnt_addr2sym(0, (ulong)rq->request_fn, "\n");
     kdbxp("make_request_fn: %s"); 
-    kdb_prnt_addr2sym(0, (ulong)rq->make_request_fn, "\n");
+    kdbx_prnt_addr2sym(0, (ulong)rq->make_request_fn, "\n");
     kdbxp("softirq_done_fn: %s"); 
-    kdb_prnt_addr2sym(0, (ulong)rq->softirq_done_fn, "\n");
+    kdbx_prnt_addr2sym(0, (ulong)rq->softirq_done_fn, "\n");
     kdbxp("prep_rq_fn: %s"); 
-    kdb_prnt_addr2sym(0, (ulong)rq->prep_rq_fn, "\n");
+    kdbx_prnt_addr2sym(0, (ulong)rq->prep_rq_fn, "\n");
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
     bd_name = (char *)rq->backing_dev_info->name;
@@ -4090,15 +4558,15 @@ kdb_cmdf_reqq(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t kdb_usgf_netdevs(void)
+static kdbx_cpu_cmd_t kdb_usgf_netdevs(void)
 {
     kdbxp("netdevs: list network devices (struct net_device)\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_netdevs(int argc, const char **argv, struct pt_regs *regs)
 {
-    struct net_device *nd;
+    struct net_device *nd;      /* include/linux/netdevice.h */
 
     if (argc > 1 && *argv[1] == '?')
         return kdb_usgf_netdevs();
@@ -4129,15 +4597,15 @@ static void kdb_print_netdev(struct net_device *nd)
     kdbxp("\n");
 }
 
-static kdb_cpu_cmd_t kdb_usgf_netdev(void)
+static kdbx_cpu_cmd_t kdb_usgf_netdev(void)
 {
     kdbxp("netdev ptr: net_device detail. run netdevs to see list\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_netdev(int argc, const char **argv, struct pt_regs *regs)
 {
-    struct net_device *nd, *tp;
+    struct net_device *nd, *tp;      /* include/linux/netdevice.h */
 
     if (argc <= 1 || (argc > 1 && *argv[1] == '?') || 
         !kdb_str2ulong(argv[1], (ulong *)&nd) )
@@ -4170,12 +4638,12 @@ static void kdb_display_socket(struct sock *sk)
     kdbxp("    sk_err: %x sk_err_soft:%x\n", sk->sk_err, sk->sk_err_soft);
 }
 
-static kdb_cpu_cmd_t kdb_usgf_socket(void)
+static kdbx_cpu_cmd_t kdb_usgf_socket(void)
 {
     kdbxp("socket ptr: print some socket details\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_socket(int argc, const char **argv, struct pt_regs *regs)
 {
     struct sock *sk;       /* include/net/sock.h  */
@@ -4189,6 +4657,32 @@ kdb_cmdf_socket(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
+static void kdbx_hex_to_ip(uint hexip, char *buf, int len)
+{
+    int v1, v2, v3, v4;
+
+    memset(buf, 0, len);
+    v1 = hexip & 0xFF;
+    v2 = (hexip & 0xFF00) >> 8;
+    v3 = (hexip & 0xFF0000) >> 16;
+    v4 = (hexip & 0xFF000000) >> 24;
+    sprintf(buf, "%d.%d.%d.%d\n", v1, v2, v3, v4);
+}
+
+char *kdb_skb_csum_str(uint ip_summed)
+{
+    if (ip_summed == CHECKSUM_NONE)
+        return " CHECKSUM_NONE ";
+    else if (ip_summed == CHECKSUM_UNNECESSARY)
+        return " CHECKSUM_UNNECESSARY ";
+    else if (ip_summed == CHECKSUM_COMPLETE)
+        return " CHECKSUM_COMPLETE ";
+    else if (ip_summed == CHECKSUM_PARTIAL)
+        return " CHECKSUM_PARTIAL ";
+    else 
+        return " unknown ";
+}
+
 void kdb_display_skb(struct sk_buff *skb)
 {
     struct sock *sk;       /* include/net/sock.h  */
@@ -4199,42 +4693,48 @@ void kdb_display_skb(struct sk_buff *skb)
     kdbxp("  net_device: %p  name: %s\n", skb->dev, skb->dev->name);
 
     sk = skb->sk;
-    kdbxp("  socket: %p head: %p data:%p\n", sk, skb->head, skb->data);
+    kdbxp("  socket:%p  head:%p  data:%p\n", sk, skb->head, skb->data);
     kdb_display_socket(sk);
 
-    kdbxp("  len: %8x  data_len: %8x\n", skb->len, skb->data_len);
-    kdbxp("  mac_len: %4hx  hdr_len: %4hx nohdr:%d\n", skb->mac_len, 
+    kdbxp("  len: %x  data_len: %x  ", skb->len, skb->data_len);
+    kdbxp("  mac_len: %hx  hdr_len: %hx  nohdr:%d\n", skb->mac_len, 
           skb->hdr_len, skb->nohdr);
-    kdbxp("  protocol: %4hx vlan_proto: %4hx vlan_tci: %4hx\n",
+    kdbxp("  protocol: %4x  vlan_proto: %hx  vlan_tci: %hx\n",
           skb->protocol, skb->vlan_proto, skb->vlan_tci);
-    kdbxp("  queue_mapping: %4hx encapsulation: %d\n", 
-          skb->queue_mapping, skb->encapsulation);
+    kdbxp("  queue_mapping: %hx  encapsulation: %d csum:%d %s\n", 
+          skb->queue_mapping, skb->encapsulation, skb->ip_summed,
+          kdb_skb_csum_str(skb->ip_summed));
 
     tcphdr = tcp_hdr(skb);
-    kdbxp("  tcp/transport_header: %4hx %p hdrlen:%d\n", skb->transport_header,
+    kdbxp("  tcp/transport_header: %4hx %p  hdrlen:%d\n", skb->transport_header,
           tcphdr, tcp_hdrlen(skb));
     if (tcphdr) {
-        kdbxp("    src: %4hx dest:%4hx window:%4hx len:%x\n", tcphdr->source,
+        kdbxp("    src: %4hx  dest:%4hx  window:%4hx  len:%x\n", tcphdr->source,
               tcphdr->dest, tcphdr->window, tcp_hdrlen(skb));
     }
     iphdr = ip_hdr(skb);
-    kdbxp("  ip/network_header: %4hx %p\n", skb->network_header, iphdr);
+    kdbxp("  ip/network_header: %4hx %p   len:%d\n", skb->network_header, 
+          iphdr, iphdr->tot_len);
     if (iphdr) {
-        kdbxp("    saddr: %8x daddr: %8x len:0x%x\n", ntohl(iphdr->saddr), 
-              ntohl(iphdr->daddr), iphdr->tot_len);
+        char b1[16], b2[16]; 
+        uint saddr = iphdr->saddr, daddr = iphdr->daddr;
+        
+        kdbx_hex_to_ip(saddr, b1, sizeof(b1)); 
+        kdbx_hex_to_ip(daddr, b2, sizeof(b2));
+        kdbxp("    saddr: %8x/%s  daddr: %8x/%s\n", saddr, b1, daddr, b2);
     }
     kdbxp("  mac_header: %4hx %p\n", skb->mac_header, skb_mac_header(skb));
-    kdbxp("  inner headers: protocol: %4hx transport:%4hx network:%4hx"
-          " mac: %4hx\n", skb->inner_protocol, skb->inner_transport_header,
+    kdbxp("  inner headers: protocol: %4hx  transport:%4hx  network:%4hx"
+          "  mac: %4hx\n", skb->inner_protocol, skb->inner_transport_header,
           skb->inner_network_header, skb->inner_mac_header);
 }
 
-static kdb_cpu_cmd_t kdb_usgf_skb(void)
+static kdbx_cpu_cmd_t kdb_usgf_skb(void)
 {
     kdbxp("skb ptr: print some skb details\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_skb(int argc, const char **argv, struct pt_regs *regs)
 {
     struct sk_buff *skb;        /* linux/skbuff.h */
@@ -4248,7 +4748,7 @@ kdb_cmdf_skb(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
-#ifdef __KDBX_SUPPORT_FOR_HYPERV
+#ifdef __KDBX_SUPPORT_FOR_HYPERV  /* also used in drivers/net/hyperv/netvsc.c */
 #include "../drivers/net/hyperv/hyperv_net.h"
 
 static void kdb_display_vmbus_channel(struct vmbus_channel *vb)
@@ -4283,12 +4783,12 @@ static void kdb_display_vmbus_channel(struct vmbus_channel *vb)
           rr->pending_send_sz);
 }
 
-static kdb_cpu_cmd_t kdb_usgf_vmbusc(void)
+static kdbx_cpu_cmd_t kdb_usgf_vmbusc(void)
 {
     kdbxp("vmbusc ptr: print few struct vmbus_channel fields\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_vmbusc(int argc, const char **argv, struct pt_regs *regs)
 {
     struct vmbus_channel *vb;
@@ -4380,12 +4880,12 @@ void kdb_display_netvsc_info(struct netvsc_device *nv)
     kdbxp("\n");
 }
 
-static kdb_cpu_cmd_t kdb_usgf_netvsc(void)
+static kdbx_cpu_cmd_t kdb_usgf_netvsc(void)
 {
     kdbxp("netvsc [ptr]: print few struct netvsc_device fields\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_netvsc(int argc, const char **argv, struct pt_regs *regs)
 {
     struct netvsc_device *nv;
@@ -4405,27 +4905,66 @@ kdb_cmdf_netvsc(int argc, const char **argv, struct pt_regs *regs)
 #endif /*  __KDBX_SUPPORT_FOR_HYPERV */
 
 /* stub to quickly and easily add a new command */
-static kdb_cpu_cmd_t kdb_usgf_usr1(void)
+static kdbx_cpu_cmd_t kdb_usgf_usr1(void)
 {
     kdbxp("usr1: add any arbitrary cmd using this in kdb_cmds.c\n");
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t
+ulong mukaddr=(ulong)0xffffffff825145d0;
+static kdbx_cpu_cmd_t
 kdb_cmdf_usr1(int argc, const char **argv, struct pt_regs *regs)
 {
+    ulong mukl = (ulong)0xdeadbeefdeadbeef;
+
     if (argc > 1 && *argv[1] == '?')
         return kdb_usgf_usr1();
+
+    if ( probe_kernel_read((void *)&mukl, (void *)mukaddr, 8) )
+        kdbxp("probe kernel failed to read:%lx\n", mukaddr);
+    else
+        kdbxp("%lx: %lx\n", mukaddr, mukl);
+    
+    kdbxp("direct read of %lx: %lx\n", mukaddr, *(ulong *)mukaddr);
 
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t kdb_usgf_kdbcur(void)
+static kdbx_cpu_cmd_t kdb_usgf_cons(void)
+{
+    kdbxp("kdbcur: show active consoles\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_cons(int argc, const char **argv, struct pt_regs *regs)
+{
+    struct console *c;
+    int kdbx_tty_line;
+    struct tty_driver *kdbx_tty_driver;
+
+
+    kdbxp("Consoles are:\n");
+    for_each_console(c) {
+        kdbxp("Console: %s\n", c->name);
+        kdbxp("\trd:%p  wr:%p\n", c->read, c->write);
+        kdbxp("\ttty_driver:%p  setup:%p\n", c->device, c->setup);
+        kdbxp("\n");
+    }
+
+    kdbx_tty_driver = tty_find_polling_driver("ttyS0", &kdbx_tty_line);
+    kdbxp("ttyS0: kdbx_tty_driver->ops->poll_get_char is: %p\n",
+          kdbx_tty_driver->ops->poll_get_char);
+
+    return KDB_CPU_MAIN_KDB;
+}
+
+
+static kdbx_cpu_cmd_t kdb_usgf_kdbcur(void)
 {
     kdbxp("kdbcur: show debug info currently in kdb\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_kdbcur(int argc, const char **argv, struct pt_regs *regs)
 {
     int cpu;
@@ -4434,7 +4973,7 @@ kdb_cmdf_kdbcur(int argc, const char **argv, struct pt_regs *regs)
     if (argc > 1 && *argv[1] == '?')
         return kdb_usgf_kdbcur();
 
-    kdbxp("%s   regs:%016lx", kdb_guest_mode(regs) ? "guest_mode" : "host_mode",
+    kdbxp("%s   regs:%016lx",kdbx_guest_mode(regs) ? "guest_mode" : "host_mode",
           regs);
 
     asm volatile("pushfq;\n\t"
@@ -4452,19 +4991,19 @@ kdb_cmdf_kdbcur(int argc, const char **argv, struct pt_regs *regs)
 #endif
 
     for_each_online_cpu(cpu) {
-        kdb_cpu_cmd_t cmd = kdb_cpu_cmd[cpu];
+        kdbx_cpu_cmd_t cmd = kdbx_cpu_cmd[cpu];
 
         kdbxp("cpu:%d cmd:%d %s\n", cpu, cmd, kdb_cpu_cmd_str(cmd));
     }
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdb_cpu_cmd_t kdb_usgf_h(void)
+static kdbx_cpu_cmd_t kdb_usgf_h(void)
 {
     kdbxp("h: display all commands. See kdb/README for more info\n");
     return KDB_CPU_MAIN_KDB;
 }
-static kdb_cpu_cmd_t
+static kdbx_cpu_cmd_t
 kdb_cmdf_h(int argc, const char **argv, struct pt_regs *regs)
 {
     kdbtab_t *tbp;
@@ -4484,7 +5023,7 @@ kdb_cmdf_h(int argc, const char **argv, struct pt_regs *regs)
 }
 
 /* ===================== cmd table initialization ========================== */
-void __init kdb_init_cmdtab(void)
+void __init kdbx_init_cmdtab(void)
 {
   static kdbtab_t _kdb_cmd_table[] = {
 
@@ -4525,9 +5064,6 @@ void __init kdb_init_cmdtab(void)
     {"pcpu",kdb_cmdf_pcpu, kdb_usgf_pcpu, 1, KDB_REPEAT_NONE},
     {"slk",kdb_cmdf_slk, kdb_usgf_slk, 1, KDB_REPEAT_NONE},
 
-    {"sym",  kdb_cmdf_sym,   kdb_usgf_sym,   1, KDB_REPEAT_NONE},
-    {"mod",  kdb_cmdf_mods,  kdb_usgf_mods,  1, KDB_REPEAT_NONE},
-
     {"tl", kdb_cmdf_tl, kdb_usgf_tl, 1, KDB_REPEAT_NONE},
     {"ts", kdb_cmdf_ts, kdb_usgf_ts, 1, KDB_REPEAT_NONE},
     {"sched", kdb_cmdf_sched, kdb_usgf_sched, 1, KDB_REPEAT_NONE},
@@ -4536,20 +5072,17 @@ void __init kdb_init_cmdtab(void)
     {"dmsr",  kdb_cmdf_dmsr,  kdb_usgf_dmsr, 1, KDB_REPEAT_NONE},
     {"cpuid",  kdb_cmdf_cpuid,  kdb_usgf_cpuid, 1, KDB_REPEAT_NONE},
 
-    {"dtrq", kdb_cmdf_dtrq,  kdb_usgf_dtrq, 1, KDB_REPEAT_NONE},
+    {"trq", kdb_cmdf_trq,  kdb_usgf_trq, 1, KDB_REPEAT_NONE},
     {"didt", kdb_cmdf_didt,  kdb_usgf_didt, 1, KDB_REPEAT_NONE},
     {"dgdt", kdb_cmdf_dgdt,  kdb_usgf_dgdt, 1, KDB_REPEAT_NONE},
     {"dirq", kdb_cmdf_dirq,  kdb_usgf_dirq, 1, KDB_REPEAT_NONE},
     {"dvit", kdb_cmdf_dvit,  kdb_usgf_dvit, 1, KDB_REPEAT_NONE},
     {"dpage", kdb_cmdf_dpage,  kdb_usgf_dpage, 1, KDB_REPEAT_NONE},
 
-    {"skvm", kdb_cmdf_skvm,  kdb_usgf_skvm, 1, KDB_REPEAT_NONE},
-    {"vcpu", kdb_cmdf_vcpu,  kdb_usgf_vcpu,  1, KDB_REPEAT_NONE},
-    {"varch", kdb_cmdf_varch,  kdb_usgf_varch,  1, KDB_REPEAT_NONE},
-    {"dvmc", kdb_cmdf_dvmc,  kdb_usgf_dvmc, 1, KDB_REPEAT_NONE},
-    {"p2m", kdb_cmdf_p2m,  kdb_usgf_p2m, 1, KDB_REPEAT_NONE},
-    {"wept", kdb_cmdf_wept,  kdb_usgf_wept, 1, KDB_REPEAT_NONE},
-    // {"wpt", kdb_cmdf_wpt,  kdb_usgf_wpt, 1, KDB_REPEAT_NONE},
+    /* generic kernel data structures */
+
+    /* all devices, pci, character, block, net, ... */
+    {"vhostdevs", kdb_cmdf_vhostdevs,  kdb_usgf_vhostdevs, 1, KDB_REPEAT_NONE},
 
     /* block device, file system, char device, ... */
     {"bio", kdb_cmdf_bio,  kdb_usgf_bio, 1, KDB_REPEAT_NONE},
@@ -4560,6 +5093,22 @@ void __init kdb_init_cmdtab(void)
     {"netdev", kdb_cmdf_netdev,  kdb_usgf_netdev, 1, KDB_REPEAT_NONE},
     {"socket",     kdb_cmdf_socket, kdb_usgf_socket, 1, KDB_REPEAT_NONE},
     {"skb",     kdb_cmdf_skb, kdb_usgf_skb, 1, KDB_REPEAT_NONE},
+
+    {"sym",  kdb_cmdf_sym,   kdb_usgf_sym,   1, KDB_REPEAT_NONE},
+    {"mod",  kdb_cmdf_mods,  kdb_usgf_mods,  1, KDB_REPEAT_NONE},
+
+    /* KVM related */
+    {"skvm", kdb_cmdf_skvm,  kdb_usgf_skvm, 1, KDB_REPEAT_NONE},
+    {"vms", kdb_cmdf_vms,  kdb_usgf_vms, 1, KDB_REPEAT_NONE},
+    {"vcpu", kdb_cmdf_vcpu,  kdb_usgf_vcpu,  1, KDB_REPEAT_NONE},
+    {"varch", kdb_cmdf_varch,  kdb_usgf_varch,  1, KDB_REPEAT_NONE},
+    {"dvmc", kdb_cmdf_dvmc,  kdb_usgf_dvmc, 1, KDB_REPEAT_NONE},
+    {"p2m", kdb_cmdf_p2m,  kdb_usgf_p2m, 1, KDB_REPEAT_NONE},
+    {"wept", kdb_cmdf_wept,  kdb_usgf_wept, 1, KDB_REPEAT_NONE},
+    {"wpt", kdb_cmdf_wpt,  kdb_usgf_wpt, 1, KDB_REPEAT_NONE},
+    {"virtq", kdb_cmdf_virtq,  kdb_usgf_virtq, 1, KDB_REPEAT_NONE},
+    {"virtscsi", kdb_cmdf_virtscsi,  kdb_usgf_virtscsi, 1, KDB_REPEAT_NONE},
+    {"vmiodevs", kdb_cmdf_vmiodevs,  kdb_usgf_vmiodevs, 1, KDB_REPEAT_NONE},
 
 #ifdef __KDBX_SUPPORT_FOR_HYPERV
     /* Hyper-V related */
@@ -4573,6 +5122,7 @@ void __init kdb_init_cmdtab(void)
     {"trcz",  kdb_cmdf_trcz,   kdb_usgf_trcz,   0, KDB_REPEAT_NONE},
     {"trcp",  kdb_cmdf_trcp,   kdb_usgf_trcp,   1, KDB_REPEAT_NONE},
 
+    {"cons", kdb_cmdf_cons, kdb_usgf_cons, 1, KDB_REPEAT_NONE},
     {"usr1",  kdb_cmdf_usr1,   kdb_usgf_usr1,   1, KDB_REPEAT_NONE},
     {"kdbcur",  kdb_cmdf_kdbcur,   kdb_usgf_kdbcur,   1, KDB_REPEAT_NONE},
     {"kdbf",  kdb_cmdf_kdbf,   kdb_usgf_kdbf,   1, KDB_REPEAT_NONE},

@@ -18,11 +18,19 @@
 
 #include "include/kdbxinc.h"
 
-/* information for symbols for a guest (includeing dom 0 ) is saved here */
+/* information for symbols for a guest (includeing dom 0 ) is saved here
+ * OL7:  CONFIG_KALLSYMS_BASE_RELATIVE && CONFIG_KALLSYMS_ABSOLUTE_PERCPU */
 struct gst_syminfo {           /* guest symbols info */
     pid_t gpid;                /* guest pid */
     int   bitness;             /* 32 or 64 */
-    void *addrtblp;            /* ptr to (32/64)addresses tbl */
+    int ol7defsyms;            /* OL7 default symbol configs. see above */
+    union {
+        void *addrtblp;            /* ptr to (32/64)addresses tbl */
+        struct ol7defsyms {
+            ulong relbasea;
+            int *offsetsa;
+        } s1;
+    } u;
     u8   *toktbl;              /* ptr to kallsyms_token_table */
     u16  *tokidxtbl;           /* ptr to kallsyms_token_index */
     u8   *kallsyms_names;      /* ptr to kallsyms_names */
@@ -41,7 +49,7 @@ static struct gst_syminfo *kdb_get_syminfo_slot(void)
     int i;
 
     for (i=0; i < MAX_CACHE; i++)
-        if (gst_syminfoa[i].addrtblp == NULL)
+        if (gst_syminfoa[i].kallsyms_names == NULL)
             return (&gst_syminfoa[i]);      
 
     return NULL;
@@ -52,19 +60,19 @@ static struct gst_syminfo *kdb_gpid2syminfop(pid_t gpid)
     int i;
 
     for (i=0; i < MAX_CACHE; i++)
-        if ( kdb_pid2tgid(gst_syminfoa[i].gpid) == kdb_pid2tgid(gpid) )
+        if ( kdbx_pid2tgid(gst_syminfoa[i].gpid) == kdbx_pid2tgid(gpid) )
             return (&gst_syminfoa[i]);      
 
     return NULL;
 }
 
-int kdb_guest_sym_loaded(pid_t gpid)
+int kdbx_guest_sym_loaded(pid_t gpid)
 {
     return kdb_gpid2syminfop(gpid) ? 1 : 0;
 }
 
 /* check if an address looks like text address in guest */
-int kdb_is_addr_guest_text(kdbva_t addr, pid_t gpid)
+int kdbx_is_addr_guest_text(kdbva_t addr, pid_t gpid)
 {
     struct gst_syminfo *gp = kdb_gpid2syminfop(gpid);
 
@@ -83,35 +91,40 @@ static kdbva_t kdb_rd_guest_addrtbl(struct gst_syminfo *gp, int idx)
     kdbva_t addr, retaddr=0;
     int num = gp->bitness/8;       /* whether 4 byte or 8 byte ptrs */
     pid_t gpid = gp->gpid;
-    struct kvm_vcpu *vp = kdb_pid_to_vcpu(gpid, 0);
+    struct kvm_vcpu *vp = kdbx_pid_to_vcpu(gpid, 0);
 
-    addr = (kdbva_t)(((char *)gp->addrtblp) + idx * num);
-    KDBGP1("rdguestaddrtbl:addr:%lx idx:%d\n", addr, idx);
+    if ( gp->ol7defsyms ) {
+        addr = (kdbva_t)(((char *)gp->u.s1.offsetsa) + idx * num);
+    } else
+        addr = (kdbva_t)(((char *)gp->u.addrtblp) + idx * num);
 
-    if (kdb_read_mem(addr, (kdbbyt_t *)&retaddr, num, vp) != num) {
+    KDBGP1("rdguestaddrtbl:el7:%d addr:%lx idx:%d\n", gp->ol7defsyms, addr,idx);
+    if (kdbx_read_mem(addr, (kdbbyt_t *)&retaddr, num, vp) != num) {
         kdbxp("Can't read addrtbl gpid:%d at:%lx\n", gpid, addr);
         return 0;
     }
-    KDBGP1("rdguestaddrtbl:exit:retaddr:%lx\n", retaddr);
+    if ( gp->ol7defsyms && (long)retaddr < 0)
+        retaddr = gp->u.s1.relbasea - 1 - (long)retaddr;
 
+    KDBGP1("rdguestaddrtbl:exit:retaddr:%lx\n", retaddr);
     return retaddr;
 }
 
-/* Based on el5 kallsyms.c file. */
+/* copied from kallsyms_expand_symbol in el5 kallsyms.c file. */
 static unsigned int 
 kdb_expand_el5_sym(struct gst_syminfo *gp, unsigned int off, char *result)
 {   
     int len, skipped_first = 0;
     u8 u8idx, *tptr, *datap;
     pid_t gpid = gp->gpid;
-    struct kvm_vcpu *vp = kdb_pid_to_vcpu(gpid, 0);
+    struct kvm_vcpu *vp = kdbx_pid_to_vcpu(gpid, 0);
 
     *result = '\0';
 
     /* get the compressed symbol length from the first symbol byte */
     datap = gp->kallsyms_names + off;
     len = 0;
-    if ((kdb_read_mem((kdbva_t)datap, (kdbbyt_t *)&len, 1, vp)) != 1) {
+    if ((kdbx_read_mem((kdbva_t)datap, (kdbbyt_t *)&len, 1, vp)) != 1) {
         KDBGP("failed to read guest memory\n");
         return 0;
     }
@@ -125,12 +138,12 @@ kdb_expand_el5_sym(struct gst_syminfo *gp, unsigned int off, char *result)
      * entry for that byte */
     while(len) {
         u16 u16idx, *u16p;
-        if (kdb_read_mem((kdbva_t)datap, (kdbbyt_t *)&u8idx, 1, vp) != 1) {
+        if (kdbx_read_mem((kdbva_t)datap, (kdbbyt_t *)&u8idx, 1, vp) != 1) {
             kdbxp("memory (u8idx) read error:%p\n",gp->tokidxtbl);
             return 0;
         }
         u16p = u8idx + gp->tokidxtbl;
-        if (kdb_read_mem((kdbva_t)u16p, (kdbbyt_t *)&u16idx, 2, vp) != 2) {
+        if (kdbx_read_mem((kdbva_t)u16p, (kdbbyt_t *)&u16idx, 2, vp) != 2) {
             kdbxp("tokidxtbl read error:%p\n", u16p);
             return 0;
         }
@@ -138,7 +151,7 @@ kdb_expand_el5_sym(struct gst_syminfo *gp, unsigned int off, char *result)
         datap++;
         len--;
 
-        while ((kdb_read_mem((kdbva_t)tptr, (kdbbyt_t *)&u8idx, 1, vp)==1) &&
+        while ((kdbx_read_mem((kdbva_t)tptr, (kdbbyt_t *)&u8idx, 1, vp)==1) &&
                u8idx) {
 
             if(skipped_first) {
@@ -163,12 +176,12 @@ kdb_expand_el4_sym(struct gst_syminfo *gp, int low, char *result, char *symp)
     u8 *nmp = gp->kallsyms_names;       /* guest address space */
     kdbbyt_t byte, prefix;
     pid_t gpid = gp->gpid;
-    struct kvm_vcpu *vp = kdb_pid_to_vcpu(gpid, 0);
+    struct kvm_vcpu *vp = kdbx_pid_to_vcpu(gpid, 0);
 
     KDBGP1("Eel4sym:nmp:%p maxidx:$%d sym:%s\n", nmp, low, symp);
     for (i=0; i <= low; i++) {
         /* unsigned prefix = *name++; */
-        if (kdb_read_mem((kdbva_t)nmp, &prefix, 1, vp) != 1) {
+        if (kdbx_read_mem((kdbva_t)nmp, &prefix, 1, vp) != 1) {
             kdbxp("failed to read:%p gpid:%x\n", nmp, gpid);
             return 0;
         }
@@ -177,7 +190,7 @@ kdb_expand_el4_sym(struct gst_syminfo *gp, int low, char *result, char *symp)
         /* strncpy(namebuf + prefix, name, KSYM_NAME_LEN - prefix); */
         addr = (long)result + prefix;
         for (j=0; j < EL4_NMLEN-prefix; j++) {
-            if (kdb_read_mem((kdbva_t)nmp, &byte, 1, vp) != 1) {
+            if (kdbx_read_mem((kdbva_t)nmp, &byte, 1, vp) != 1) {
                 kdbxp("failed read:%p gpid:%x\n", nmp, gpid);
                 return 0;
             }
@@ -193,7 +206,7 @@ kdb_expand_el4_sym(struct gst_syminfo *gp, int low, char *result, char *symp)
 
         /* kallsyms.c: name += strlen(name) + 1; */
         if (j == EL4_NMLEN-prefix && byte != '\0')
-            while (kdb_read_mem((kdbva_t)nmp, &byte, 1, vp) && byte != '\0')
+            while (kdbx_read_mem((kdbva_t)nmp, &byte, 1, vp) && byte != '\0')
                 nmp++;
     }
     KDBGP1("Xel4sym: na-ga-da\n");
@@ -205,11 +218,11 @@ static uint kdb_get_el5_symoffset(struct gst_syminfo *gp, long pos)
     int i;
     u8 data, *namep;
     pid_t gpid = gp->gpid;
-    struct kvm_vcpu *vp = kdb_pid_to_vcpu(gpid, 0);
+    struct kvm_vcpu *vp = kdbx_pid_to_vcpu(gpid, 0);
 
     namep = gp->kallsyms_names;
     for (i=0; i < pos; i++) {
-        if (kdb_read_mem((kdbva_t)namep, &data, 1, vp) != 1) {
+        if (kdbx_read_mem((kdbva_t)namep, &data, 1, vp) != 1) {
             kdbxp("Can't read gpid:$%d mem:%p\n", gpid, namep);
             return 0;
         }
@@ -222,7 +235,7 @@ static uint kdb_get_el5_symoffset(struct gst_syminfo *gp, long pos)
  * for a given guest gpid, convert addr to symbol. 
  * offset is set to  addr - symbolstart
  */
-char *kdb_guest_addr2sym(unsigned long addr, pid_t gpid, ulong *offsp)
+char *kdbx_guest_addr2sym(unsigned long addr, pid_t gpid, ulong *offsp)
 {
     static char namebuf[KSYM_NAME_LEN+1];
     unsigned long low, high, mid;
@@ -230,7 +243,8 @@ char *kdb_guest_addr2sym(unsigned long addr, pid_t gpid, ulong *offsp)
 
     *offsp = 0;
     if( !gp || gp->kallsyms_num_syms == 0 )
-        return " ??? ";
+        return NULL;
+        // return " ??? ";
 
     namebuf[0] = namebuf[KSYM_NAME_LEN] = '\0';
 
@@ -258,20 +272,14 @@ char *kdb_guest_addr2sym(unsigned long addr, pid_t gpid, ulong *offsp)
     return namebuf;
 }
 
-
-/* 
- * save guest (dom0 and others) symbols info : gpid and following addresses:
- *     &kallsyms_names &kallsyms_addresses &kallsyms_num_syms \
- *     &kallsyms_token_table &kallsyms_token_index
- */
-void
-kdb_sav_guest_syminfo(pid_t gpid, long namesp, long addrap, long nump,
-                      long toktblp, long tokidxp)
+void kdbx_sav_guest_syminfo(pid_t gpid, ulong namesp, ulong nump, ulong addrap,
+                            ulong relbase, ulong offsets, ulong toktblp, 
+                            ulong tokidxp)
 {
     int bytes;
     long val = 0;    /* must be set to zero for 32 on 64 cases */
     struct gst_syminfo *gp = kdb_get_syminfo_slot();
-    struct kvm_vcpu *vp = kdb_pid_to_vcpu(gpid, 0);
+    struct kvm_vcpu *vp = kdbx_pid_to_vcpu(gpid, 0);
 
     if (gp == NULL) {
         kdbxp("kdb:kdb_sav_dom_syminfo():Table full.. symbols not saved\n");
@@ -280,38 +288,60 @@ kdb_sav_guest_syminfo(pid_t gpid, long namesp, long addrap, long nump,
     memset(gp, 0, sizeof(*gp));
 
     gp->gpid = gpid;
-    gp->bitness = kdb_guest_bitness(gpid);
-    gp->addrtblp = (void *)addrap;
+    gp->bitness = kdbx_guest_bitness(gpid);
+
+    if ( addrap )
+        gp->u.addrtblp = (void *)addrap;
+    else {
+        gp->u.s1.relbasea = relbase;
+        gp->u.s1.offsetsa = (int *)offsets;
+        gp->ol7defsyms = 1;
+    }
     gp->kallsyms_names = (u8 *)namesp;
     gp->toktbl = (u8 *)toktblp;
     gp->tokidxtbl = (u16 *)tokidxp;
 
-    KDBGP("gpid:%d bitness:$%d numsyms:$%ld arrayp:%p\n", gpid,
-          gp->bitness, gp->kallsyms_num_syms, gp->addrtblp);
+    KDBGP("gpid:%d bitness:$%d namep:%p nump:%lx addr:%p relb:%lx offs:%lx\n",
+          gpid, gp->bitness, gp->kallsyms_names, nump, gp->u.addrtblp,
+          gp->u.s1.offsetsa, gp->u.s1.relbasea);
 
     bytes = gp->bitness/8;
-    if (kdb_read_mem(nump, (kdbbyt_t *)&val, bytes, vp) != bytes) {
-
+    if (kdbx_read_mem(nump, (kdbbyt_t *)&val, bytes, vp) != bytes) {
         kdbxp("Unable to read number of symbols from:%lx\n", nump);
         memset(gp, 0, sizeof(*gp));
         return;
     } else
-        kdbxp("Number of symbols:$%ld\n", val);
+        kdbxp("Number of symbols:$%ld(0x%lx)\n", val, val);
 
+    /* sanity check: 4.14.35 has 96230 symbols */
+    if ( val > 125000 ) {
+        kdbxp("num of symbols seems unreasonable. Quitting...\n");
+        return;
+    }
     gp->kallsyms_num_syms = val;
 
     bytes = (gp->bitness/8) * gp->kallsyms_num_syms;
-    gp->stext = kdb_guest_sym2addr("_stext", gpid);
-    gp->etext = kdb_guest_sym2addr("_etext", gpid);
-    if (!gp->stext || !gp->etext)
-        kdbxp("Warn: Can't find stext/etext\n");
-
+    gp->stext = kdbx_guest_sym2addr("_stext", gpid);
+    if ( gp->stext == 0 ) {
+        kdbxp("kdbx: Can't find stext/etext\n");
+        return;
+    }
+    gp->etext = kdbx_guest_sym2addr("_etext", gpid);
+    if ( gp->etext == 0 ) {
+        kdbxp("kdbx: Can't find etext/etext\n");
+        return;
+    }
     if (gp->toktbl && gp->tokidxtbl) {
-        gp->sinittext = kdb_guest_sym2addr("_sinittext", gpid);
-        gp->einittext = kdb_guest_sym2addr("_einittext", gpid);
-
-        if (!gp->sinittext || !gp->einittext)
-            kdbxp("Warn: Can't find sinittext/einittext\n");
+        gp->sinittext = kdbx_guest_sym2addr("_sinittext", gpid);
+        if ( gp->sinittext == 0 ) {
+            kdbxp("kdbx: Can't find sinittext\n");
+            return;
+        }
+        gp->einittext = kdbx_guest_sym2addr("_einittext", gpid);
+        if ( gp->einittext == 0 ) {
+            kdbxp("kdbx: Can't find einittext\n");
+            return;
+        }
     }
     KDBGP1("stxt:%lx etxt:%lx sitxt:%lx eitxt:%lx\n", gp->stext, gp->etext,
            gp->sinittext, gp->einittext);
@@ -322,7 +352,7 @@ kdb_sav_guest_syminfo(pid_t gpid, long namesp, long addrap, long nump,
 /*
  * given a symbol string for a guest/gpid, return its address
  */
-kdbva_t kdb_guest_sym2addr(char *symp, pid_t gpid)
+kdbva_t kdbx_guest_sym2addr(char *symp, pid_t gpid)
 {
     char namebuf[KSYM_NAME_LEN+1];
     int i, off=0;
@@ -338,13 +368,17 @@ kdbva_t kdb_guest_sym2addr(char *symp, pid_t gpid)
         return(kdb_expand_el4_sym(gp, gp->kallsyms_num_syms, namebuf, symp));
 
     for (i=0; i < gp->kallsyms_num_syms; i++) {
-        off = kdb_expand_el5_sym(gp, off, namebuf);
-        KDBGP1("i:%d namebuf:%s\n", i, namebuf);
+        int rc = kdb_expand_el5_sym(gp, off, namebuf);
 
+        KDBGP1("i:%d namebuf:%s\n", i, namebuf);
+        if ( rc == 0 ) {
+            kdbxp("failed to expand symbol at off:%d/0x%x i:%d\n", off, off,i);
+            break;
+        }
+        off = rc;
         if ( strcmp(namebuf, symp) == 0 )
             return kdb_rd_guest_addrtbl(gp, i);
     }
     KDBGP1("sym2a: exit: na-ga-da\n");
-
     return 0;
 }
