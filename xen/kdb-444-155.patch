@@ -1,0 +1,1129 @@
+diff --git a/xen/Makefile b/xen/Makefile
+index c9e0299..da2af20 100644
+--- a/xen/Makefile
++++ b/xen/Makefile
+@@ -100,6 +100,8 @@ _clean: delete-unfresh-files
+ 	$(MAKE) -f $(BASEDIR)/Rules.mk -C crypto clean
+ 	$(MAKE) -f $(BASEDIR)/Rules.mk -C tests clean
+ 	$(MAKE) -f $(BASEDIR)/Rules.mk -C arch/$(TARGET_ARCH) clean
++	$(MAKE) -f $(BASEDIR)/Rules.mk -C kdb clean
++
+ 	rm -f include/asm *.o $(TARGET) $(TARGET).gz $(TARGET).efi $(TARGET)-syms $(TARGET)-syms.map *~ core
+ 	rm -f include/asm-*/asm-offsets.h
+ 	rm -f .banner
+@@ -173,7 +175,7 @@ include/asm-$(TARGET_ARCH)/asm-offsets.h: arch/$(TARGET_ARCH)/asm-offsets.s
+ 	  echo ""; \
+ 	  echo "#endif") <$< >$@
+ 
+-SUBDIRS = xsm arch/$(TARGET_ARCH) common drivers
++SUBDIRS = xsm arch/$(TARGET_ARCH) common drivers kdb
+ define all_sources
+     ( find include/asm-$(TARGET_ARCH) -name '*.h' -print; \
+       find include -name 'asm-*' -prune -o -name '*.h' -print; \
+diff --git a/xen/Rules.mk b/xen/Rules.mk
+index 0aa5333..99df988 100644
+--- a/xen/Rules.mk
++++ b/xen/Rules.mk
+@@ -10,6 +10,7 @@ lock_profile  ?= n
+ crash_debug   ?= n
+ frame_pointer ?= n
+ lto           ?= n
++kdb           ?= n
+ 
+ CONFIG_LIVEPATCH ?= y
+ CONFIG_ELFLOADER ?= y
+@@ -45,6 +46,7 @@ ALL_OBJS-y               += $(BASEDIR)/drivers/built_in.o
+ ALL_OBJS-y               += $(BASEDIR)/xsm/built_in.o
+ ALL_OBJS-y               += $(BASEDIR)/arch/$(TARGET_ARCH)/built_in.o
+ ALL_OBJS-$(x86)          += $(BASEDIR)/crypto/built_in.o
++ALL_OBJS-$(kdb)          += $(BASEDIR)/kdb/built_in.o
+ 
+ CFLAGS += -nostdinc -fno-builtin -fno-common
+ CFLAGS += -Werror -Wredundant-decls -Wno-pointer-arith
+@@ -71,6 +73,8 @@ CFLAGS-$(CONFIG_LIVEPATCH) += -DCONFIG_LIVEPATCH
+ CFLAGS-$(CONFIG_ELFLOADER) += -DCONFIG_EFLOADER
+ CFLAGS-$(CONFIG_MODULE) += -DCONFIG_MODULE
+ CFLAGS-$(CONFIG_FAST_SYMBOL_LOOKUP) += -DCONFIG_FAST_SYMBOL_LOOKUP
++CFLAGS-$(kdb)           += -DXEN_KDB_CONFIG
++
+ 
+ ifneq ($(max_phys_cpus),)
+ CFLAGS-y                += -DMAX_PHYS_CPUS=$(max_phys_cpus)
+diff --git a/xen/arch/x86/debug.c b/xen/arch/x86/debug.c
+index 435bd40..1aa346f 100644
+--- a/xen/arch/x86/debug.c
++++ b/xen/arch/x86/debug.c
+@@ -16,6 +16,8 @@
+  * Boston, MA 021110-1307, USA.
+  */
+ 
++#define GUEST_PAGING_LEVELS 4
++
+ #include <xen/config.h>
+ #include <xen/sched.h>
+ #include <xen/compile.h>
+@@ -24,6 +26,7 @@
+ #include <xen/guest_access.h>
+ #include <asm/debugger.h>
+ #include <asm/p2m.h>
++#include <asm/guest_pt.h>
+ 
+ /* 
+  * This file for general routines common to more than one debugger, like kdb,
+@@ -41,6 +44,53 @@
+ #define DBGP2(...) ((void)0)
+ #endif
+ 
++#ifdef XEN_KDB_CONFIG
++
++/* Below dbg_hvm_va2mfn() may get stuck on p2m lock causing kdb to hang. Hence
++ * different version for kdb.
++ * Returns: mfn for the given (hvm guest) vaddr */
++static noinline unsigned long
++dbg_hvm_va2mfn(dbgva_t vaddr, struct domain *dp, int toaddr, unsigned long *xx)
++{
++    unsigned long mfn;
++    gfn_t gfn;
++    p2m_type_t p2mt;
++    p2m_access_t p2ma;
++    walk_t gw;
++    void *mapvaddr;
++    struct p2m_domain *p2m = p2m_get_hostp2m(dp);
++    uint32_t rc, pfec = PFEC_page_present;
++    struct vcpu *v = dp->vcpu[0];
++    unsigned long cr3 = v->arch.hvm_vcpu.guest_cr[3];
++
++    DBGP2("vaddr:%lx domid:%d cr3:%lx\n", vaddr, dp->domain_id, cr3);
++    if ( !p2m || !paging_mode_translate(dp) )
++    {
++        DBGP1("p2m unset or paging mode not translate\n");
++        return INVALID_MFN;
++    }
++    mfn = p2m->get_entry(p2m, cr3 >> PAGE_SHIFT, &p2mt, &p2ma, 0, NULL);
++    if ( !mfn_valid(mfn) )
++        return INVALID_MFN;
++
++    mapvaddr = map_domain_page(mfn);
++    rc = guest_walk_tables(v, p2m, vaddr, &gw, pfec, mfn, mapvaddr);
++    unmap_domain_page(mapvaddr);
++    if ( rc )
++    {
++        DBGP1("guest walk failed.. mfn:%lx\n", mfn);
++        return INVALID_MFN;
++    }
++
++    gfn = guest_l1e_get_gfn(gw.l1e);
++    mfn = p2m->get_entry(p2m, gfn, &p2mt, &p2ma, 0, NULL);
++    DBGP2("vaddr:%lx gfn:%lx mfn:%lx\n", vaddr, gfn, mfn);
++
++    return mfn;
++}
++
++#else
++
+ /* Returns: mfn for the given (hvm guest) vaddr */
+ static unsigned long 
+ dbg_hvm_va2mfn(dbgva_t vaddr, struct domain *dp, int toaddr,
+@@ -76,6 +126,7 @@ dbg_hvm_va2mfn(dbgva_t vaddr, struct domain *dp, int toaddr,
+ 
+     return mfn;
+ }
++#endif
+ 
+ /* 
+  * pgd3val: this is the value of init_mm.pgd[3] in a PV guest. It is optional.
+diff --git a/xen/arch/x86/hvm/svm/entry.S b/xen/arch/x86/hvm/svm/entry.S
+index ef4d5f4..42def7f 100644
+--- a/xen/arch/x86/hvm/svm/entry.S
++++ b/xen/arch/x86/hvm/svm/entry.S
+@@ -39,6 +39,10 @@ ENTRY(svm_asm_do_resume)
+         call nsvm_vcpu_switch
+         ASSERT_NOT_IN_ATOMIC
+ 
++#ifdef XEN_KDB_CONFIG
++        testl $1, kdb_session_begun(%rip)
++        jnz  .Lkdb_skip_softirq
++#endif
+         mov  VCPU_processor(%rbx),%eax
+         lea  irq_stat+IRQSTAT_softirq_pending(%rip),%rdx
+         xor  %ecx,%ecx
+@@ -47,6 +51,11 @@ ENTRY(svm_asm_do_resume)
+         cmp  %ecx,(%rdx,%rax,1)
+         jne  .Lsvm_process_softirqs
+ 
++#ifdef XEN_KDB_CONFIG
++.Lkdb_skip_softirq:
++        xor  %ecx,%ecx
++#endif
++
+         cmp  %cl,VCPU_nsvm_hap_enabled(%rbx)
+ UNLIKELY_START(ne, nsvm_hap)
+         cmp  %rcx,VCPU_nhvm_p2m(%rbx)
+diff --git a/xen/arch/x86/hvm/svm/intr.c b/xen/arch/x86/hvm/svm/intr.c
+index b4cf208..728fef9 100644
+--- a/xen/arch/x86/hvm/svm/intr.c
++++ b/xen/arch/x86/hvm/svm/intr.c
+@@ -139,6 +139,14 @@ void svm_intr_assist(void)
+     struct hvm_intack intack;
+     enum hvm_intblk intblk;
+ 
++#ifdef XEN_KDB_CONFIG
++    if ( unlikely(v->arch.hvm_vcpu.single_step) )
++    {
++        guest_cpu_user_regs()->eflags |= X86_EFLAGS_TF;
++        return;
++    }
++#endif
++
+     /* Crank the handle on interrupt state. */
+     pt_update_irq(v);
+ 
+diff --git a/xen/arch/x86/hvm/svm/svm.c b/xen/arch/x86/hvm/svm/svm.c
+index b2cab4b..dce704c 100644
+--- a/xen/arch/x86/hvm/svm/svm.c
++++ b/xen/arch/x86/hvm/svm/svm.c
+@@ -2234,6 +2234,11 @@ void svm_vmexit_handler(struct cpu_user_regs *regs)
+         break;
+ 
+     case VMEXIT_EXCEPTION_DB:
++#ifdef XEN_KDB_CONFIG
++        regs->eflags &= ~X86_EFLAGS_TF;
++        if (kdb_handle_trap_entry(TRAP_debug, regs))
++	    break;
++#endif
+         if ( !v->domain->debugger_attached )
+             hvm_inject_hw_exception(TRAP_debug, HVM_DELIVER_NO_ERROR_CODE);
+         else
+@@ -2247,6 +2252,10 @@ void svm_vmexit_handler(struct cpu_user_regs *regs)
+         if ( (inst_len = __get_instruction_length(v, INSTR_INT3)) == 0 )
+             break;
+         __update_guest_eip(regs, inst_len);
++#ifdef XEN_KDB_CONFIG
++        if (kdb_handle_trap_entry(TRAP_int3, regs))
++            break;
++#endif
+         current->arch.gdbsx_vcpu_event = TRAP_int3;
+         domain_pause_for_debugger();
+         break;
+diff --git a/xen/arch/x86/hvm/svm/vmcb.c b/xen/arch/x86/hvm/svm/vmcb.c
+index 21292bb..1d15d7a 100644
+--- a/xen/arch/x86/hvm/svm/vmcb.c
++++ b/xen/arch/x86/hvm/svm/vmcb.c
+@@ -315,6 +315,36 @@ void __init setup_vmcb_dump(void)
+     register_keyhandler('v', &vmcb_dump_keyhandler);
+ }
+ 
++#if defined(XEN_KDB_CONFIG)
++/* did == 0 : display for all HVM domains. domid 0 is never HVM.
++ * vid == -1 : display for all HVM VCPUs
++ */
++void kdb_dump_vmcb(domid_t did, int vid)
++{
++    struct domain *dp;
++    struct vcpu *vp;
++
++    rcu_read_lock(&domlist_read_lock);
++    for_each_domain (dp) {
++        if (is_pv_domain(dp) || dp->is_dying)
++            continue;
++        if (did != 0 && did != dp->domain_id)
++            continue;
++
++        for_each_vcpu (dp, vp) {
++            if (vid != -1 && vid != vp->vcpu_id)
++                continue;
++
++            kdbp("  VMCB [domid: %d  vcpu:%d]:\n", dp->domain_id, vp->vcpu_id);
++            svm_vmcb_dump("kdb", vp->arch.hvm_svm.vmcb);
++            kdbp("\n");
++        }
++        kdbp("\n");
++    }
++    rcu_read_unlock(&domlist_read_lock);
++}
++#endif
++
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/xen/arch/x86/hvm/vmx/entry.S b/xen/arch/x86/hvm/vmx/entry.S
+index 3c8c749..9982204 100644
+--- a/xen/arch/x86/hvm/vmx/entry.S
++++ b/xen/arch/x86/hvm/vmx/entry.S
+@@ -59,6 +59,10 @@ ENTRY(vmx_asm_vmexit_handler)
+         call nvmx_switch_guest
+         ASSERT_NOT_IN_ATOMIC
+ 
++#ifdef XEN_KDB_CONFIG
++        testl $1, kdb_session_begun(%rip)
++        jnz  .Lkdb_skip_softirq
++#endif
+         mov  VCPU_processor(%rbx),%eax
+         lea  irq_stat+IRQSTAT_softirq_pending(%rip),%rdx
+         xor  %ecx,%ecx
+@@ -67,6 +71,10 @@ ENTRY(vmx_asm_vmexit_handler)
+         cmp  %ecx,(%rdx,%rax,1)
+         jnz  .Lvmx_process_softirqs
+ 
++#ifdef XEN_KDB_CONFIG
++.Lkdb_skip_softirq:
++        xor  %ecx,%ecx
++#endif
+         cmp  %cl,VCPU_vmx_emulate(%rbx)
+         jne .Lvmx_goto_emulator
+         cmp  %cl,VCPU_vmx_realmode(%rbx)
+diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
+index 89a5722..2ca306e 100644
+--- a/xen/arch/x86/hvm/vmx/vmcs.c
++++ b/xen/arch/x86/hvm/vmx/vmcs.c
+@@ -1352,6 +1352,10 @@ void vmx_do_resume(struct vcpu *v)
+         hvm_asid_flush_vcpu(v);
+     }
+ 
++#if defined(XEN_KDB_CONFIG)
++    __vmwrite(GUEST_DR7, kdb_dr7);
++#endif
++
+     debug_state = v->domain->debugger_attached
+                   || v->domain->arch.hvm_domain.params[HVM_PARAM_MEMORY_EVENT_INT3]
+                   || v->domain->arch.hvm_domain.params[HVM_PARAM_MEMORY_EVENT_SINGLE_STEP];
+@@ -1560,6 +1564,221 @@ void __init setup_vmcs_dump(void)
+     register_keyhandler('v', &vmcs_dump_keyhandler);
+ }
+ 
++#if defined(XEN_KDB_CONFIG)
++#define GUEST_EFER      0x2806   /* see Intel SDM page 23-20 */
++#define GUEST_EFER_HIGH 0x2807   /* see Intel SDM page 23-20 */
++
++/* it's a shame we can't use vmcs_dump_vcpu(), but it does vmx_vmcs_enter which
++ * will IPI other CPUs. also, print a subset relevant to software debugging */
++static void noinline kdb_print_vmcs(struct vcpu *vp)
++{
++    struct cpu_user_regs *regs = &vp->arch.user_regs;
++    unsigned long long x;
++
++    kdbp("*** Guest State ***\n");
++    kdbp("CR0: actual=0x%016llx, shadow=0x%016llx, gh_mask=%016llx\n",
++         (unsigned long long)vmr(GUEST_CR0),
++         (unsigned long long)vmr(CR0_READ_SHADOW), 
++         (unsigned long long)vmr(CR0_GUEST_HOST_MASK));
++    kdbp("CR4: actual=0x%016llx, shadow=0x%016llx, gh_mask=%016llx\n",
++         (unsigned long long)vmr(GUEST_CR4),
++         (unsigned long long)vmr(CR4_READ_SHADOW), 
++         (unsigned long long)vmr(CR4_GUEST_HOST_MASK));
++    kdbp("CR3: actual=0x%016llx, target_count=%d\n",
++         (unsigned long long)vmr(GUEST_CR3),
++         (int)vmr(CR3_TARGET_COUNT));
++    kdbp("     target0=%016llx, target1=%016llx\n",
++         (unsigned long long)vmr(CR3_TARGET_VALUE0),
++         (unsigned long long)vmr(CR3_TARGET_VALUE1));
++    kdbp("     target2=%016llx, target3=%016llx\n",
++         (unsigned long long)vmr(CR3_TARGET_VALUE2),
++         (unsigned long long)vmr(CR3_TARGET_VALUE3));
++    kdbp("RSP = 0x%016llx (0x%016llx)  RIP = 0x%016llx (0x%016llx)\n", 
++         (unsigned long long)vmr(GUEST_RSP),
++         (unsigned long long)regs->esp,
++         (unsigned long long)vmr(GUEST_RIP),
++         (unsigned long long)regs->eip);
++    kdbp("RFLAGS=0x%016llx (0x%016llx)  DR7 = 0x%016llx\n", 
++         (unsigned long long)vmr(GUEST_RFLAGS),
++         (unsigned long long)regs->eflags,
++         (unsigned long long)vmr(GUEST_DR7));
++    kdbp("Sysenter RSP=%016llx CS:RIP=%04x:%016llx\n",
++         (unsigned long long)vmr(GUEST_SYSENTER_ESP),
++         (int)vmr(GUEST_SYSENTER_CS),
++         (unsigned long long)vmr(GUEST_SYSENTER_EIP));
++    vmx_dump_sel("CS", GUEST_CS_SELECTOR);
++    vmx_dump_sel("DS", GUEST_DS_SELECTOR);
++    vmx_dump_sel("SS", GUEST_SS_SELECTOR);
++    vmx_dump_sel("ES", GUEST_ES_SELECTOR);
++    vmx_dump_sel("FS", GUEST_FS_SELECTOR);
++    vmx_dump_sel("GS", GUEST_GS_SELECTOR);
++    vmx_dump_sel2("GDTR", GUEST_GDTR_LIMIT);
++    vmx_dump_sel("LDTR", GUEST_LDTR_SELECTOR);
++    vmx_dump_sel2("IDTR", GUEST_IDTR_LIMIT);
++    vmx_dump_sel("TR", GUEST_TR_SELECTOR);
++    kdbp("Guest EFER = 0x%08x%08x\n",
++           (uint32_t)vmr(GUEST_EFER_HIGH), (uint32_t)vmr(GUEST_EFER));
++    kdbp("Guest PAT = 0x%08x%08x\n",
++           (uint32_t)vmr(GUEST_PAT_HIGH), (uint32_t)vmr(GUEST_PAT));
++    x  = (unsigned long long)vmr(TSC_OFFSET_HIGH) << 32;
++    x |= (uint32_t)vmr(TSC_OFFSET);
++    kdbp("TSC Offset = %016llx\n", x);
++    x  = (unsigned long long)vmr(GUEST_IA32_DEBUGCTL_HIGH) << 32;
++    x |= (uint32_t)vmr(GUEST_IA32_DEBUGCTL);
++    kdbp("DebugCtl=%016llx DebugExceptions=%016llx\n", x,
++           (unsigned long long)vmr(GUEST_PENDING_DBG_EXCEPTIONS));
++    kdbp("Interruptibility=%04x ActivityState=%04x\n",
++           (int)vmr(GUEST_INTERRUPTIBILITY_INFO),
++           (int)vmr(GUEST_ACTIVITY_STATE));
++
++    kdbp("MSRs: entry_load:$%d exit_load:$%d exit_store:$%d\n",
++         vmr(VM_ENTRY_MSR_LOAD_COUNT), vmr(VM_EXIT_MSR_LOAD_COUNT),
++         vmr(VM_EXIT_MSR_STORE_COUNT));
++
++    kdbp("\n*** Host State ***\n");
++    kdbp("RSP = 0x%016llx  RIP = 0x%016llx\n", 
++           (unsigned long long)vmr(HOST_RSP),
++           (unsigned long long)vmr(HOST_RIP));
++    kdbp("CS=%04x DS=%04x ES=%04x FS=%04x GS=%04x SS=%04x TR=%04x\n",
++           (uint16_t)vmr(HOST_CS_SELECTOR),
++           (uint16_t)vmr(HOST_DS_SELECTOR),
++           (uint16_t)vmr(HOST_ES_SELECTOR),
++           (uint16_t)vmr(HOST_FS_SELECTOR),
++           (uint16_t)vmr(HOST_GS_SELECTOR),
++           (uint16_t)vmr(HOST_SS_SELECTOR),
++           (uint16_t)vmr(HOST_TR_SELECTOR));
++    kdbp("FSBase=%016llx GSBase=%016llx TRBase=%016llx\n",
++           (unsigned long long)vmr(HOST_FS_BASE),
++           (unsigned long long)vmr(HOST_GS_BASE),
++           (unsigned long long)vmr(HOST_TR_BASE));
++    kdbp("GDTBase=%016llx IDTBase=%016llx\n",
++           (unsigned long long)vmr(HOST_GDTR_BASE),
++           (unsigned long long)vmr(HOST_IDTR_BASE));
++    kdbp("CR0=%016llx CR3=%016llx CR4=%016llx\n",
++           (unsigned long long)vmr(HOST_CR0),
++           (unsigned long long)vmr(HOST_CR3),
++           (unsigned long long)vmr(HOST_CR4));
++    kdbp("Sysenter RSP=%016llx CS:RIP=%04x:%016llx\n",
++           (unsigned long long)vmr(HOST_SYSENTER_ESP),
++           (int)vmr(HOST_SYSENTER_CS),
++           (unsigned long long)vmr(HOST_SYSENTER_EIP));
++    kdbp("Host PAT = 0x%08x%08x\n",
++           (uint32_t)vmr(HOST_PAT_HIGH), (uint32_t)vmr(HOST_PAT));
++
++    kdbp("\n*** Control State ***\n");
++    kdbp("PinBased=%08x CPUBased=%08x SecondaryExec=%08x\n",
++           (uint32_t)vmr(PIN_BASED_VM_EXEC_CONTROL),
++           (uint32_t)vmr(CPU_BASED_VM_EXEC_CONTROL),
++           (uint32_t)vmr(SECONDARY_VM_EXEC_CONTROL));
++    kdbp("EntryControls=%08x ExitControls=%08x\n",
++           (uint32_t)vmr(VM_ENTRY_CONTROLS),
++           (uint32_t)vmr(VM_EXIT_CONTROLS));
++    kdbp("ExceptionBitmap=%08x\n",
++           (uint32_t)vmr(EXCEPTION_BITMAP));
++    kdbp("PAGE_FAULT_ERROR_CODE  MASK:0x%lx  MATCH:0x%lx\n", 
++         (unsigned long)vmr(PAGE_FAULT_ERROR_CODE_MASK),
++         (unsigned long)vmr(PAGE_FAULT_ERROR_CODE_MATCH));
++    kdbp("VMEntry: intr_info=%08x errcode=%08x ilen=%08x\n",
++           (uint32_t)vmr(VM_ENTRY_INTR_INFO),
++           (uint32_t)vmr(VM_ENTRY_EXCEPTION_ERROR_CODE),
++           (uint32_t)vmr(VM_ENTRY_INSTRUCTION_LEN));
++    kdbp("VMExit: intr_info=%08x errcode=%08x ilen=%08x\n",
++           (uint32_t)vmr(VM_EXIT_INTR_INFO),
++           (uint32_t)vmr(VM_EXIT_INTR_ERROR_CODE),
++           (uint32_t)vmr(VM_ENTRY_INSTRUCTION_LEN));
++    kdbp("        reason=%08x qualification=%08x\n",
++           (uint32_t)vmr(VM_EXIT_REASON),
++           (uint32_t)vmr(EXIT_QUALIFICATION));
++    kdbp("IDTVectoring: info=%08x errcode=%08x\n",
++           (uint32_t)vmr(IDT_VECTORING_INFO),
++           (uint32_t)vmr(IDT_VECTORING_ERROR_CODE));
++    kdbp("TPR Threshold = 0x%02x\n",
++           (uint32_t)vmr(TPR_THRESHOLD));
++    kdbp("EPT pointer = 0x%08x%08x\n",
++           (uint32_t)vmr(EPT_POINTER_HIGH), (uint32_t)vmr(EPT_POINTER));
++    kdbp("Virtual processor ID = 0x%04x\n",
++           (uint32_t)vmr(VIRTUAL_PROCESSOR_ID));
++    kdbp("=================================================================\n");
++}
++
++/* Flush VMCS on this cpu if it needs to: 
++ *   - Upon leaving kdb, the HVM cpu will resume in vmx_vmexit_handler() and 
++ *     do __vmreads. So, the VMCS pointer can't be left cleared.
++ *   - Doing __vmpclear will set the vmx state to 'clear', so to resume a
++ *     vmlaunch must be done and not vmresume. This means, we must clear 
++ *     arch_vmx->launched.
++ */
++void kdb_curr_cpu_flush_vmcs(void)
++{
++    struct domain *dp;
++    struct vcpu *vp;
++    int ccpu = smp_processor_id();
++    struct vmcs_struct *cvp = this_cpu(current_vmcs);
++
++    if (this_cpu(current_vmcs) == NULL)
++        return;             /* no HVM active on this CPU */
++
++    kdbp("KDB:[%d] curvmcs:%lx/%lx\n", ccpu, cvp, virt_to_maddr(cvp));
++
++    /* looks like we got one. unfortunately, current_vmcs points to vmcs 
++     * and not VCPU, so we gotta search the entire list... */
++    for_each_domain (dp) {
++        if ( is_pv_domain(dp) || dp->is_dying )
++            continue;
++        for_each_vcpu (dp, vp) {
++            if ( vp->arch.hvm_vmx.vmcs == cvp ) {
++                __vmpclear(virt_to_maddr(vp->arch.hvm_vmx.vmcs));
++                __vmptrld(virt_to_maddr(vp->arch.hvm_vmx.vmcs));
++                vp->arch.hvm_vmx.launched = 0;
++                this_cpu(current_vmcs) = NULL;
++                kdbp("KDB:[%d] %d:%d current_vmcs:%lx flushed\n", 
++		     ccpu, dp->domain_id, vp->vcpu_id, cvp, virt_to_maddr(cvp));
++            }
++        }
++    }
++}
++
++/*
++ * domid == 0 : display for all HVM domains  (dom0 is never an HVM domain)
++ * vcpu id == -1 : display all vcpuids
++ * PreCondition: all HVM cpus (including current cpu) have flushed VMCS
++ */
++void kdb_dump_vmcs(domid_t did, int vid)
++{
++    struct domain *dp;
++    struct vcpu *vp;
++    struct vmcs_struct  *vmcsp;
++    u64 addr = -1;
++
++    ASSERT(!local_irq_is_enabled());     /* kdb should always run disabled */
++    __vmptrst(&addr);
++
++    for_each_domain ( dp ) 
++    {
++        if ( is_pv_domain(dp) || dp->is_dying )
++            continue;
++        if ( did != 0 && did != dp->domain_id )
++            continue;
++
++        for_each_vcpu (dp, vp) {
++            if ( vid != -1 && vid != vp->vcpu_id )
++                continue;
++
++	    vmcsp = vp->arch.hvm_vmx.vmcs;
++            kdbp("VMCS %lx/%lx [domid:%d (%p)  vcpu:%d (%p)]:\n", vmcsp,
++	         virt_to_maddr(vmcsp), dp->domain_id, dp, vp->vcpu_id, vp);
++            __vmptrld(virt_to_maddr(vmcsp));
++            kdb_print_vmcs(vp);
++            __vmpclear(virt_to_maddr(vmcsp));
++            vp->arch.hvm_vmx.launched = 0;
++        }
++        kdbp("\n");
++    }
++    /* restore orig vmcs pointer for __vmreads in vmx_vmexit_handler() */
++    if (addr && addr != (u64)-1)
++        __vmptrld(addr);
++}
++#endif
+ 
+ /*
+  * Local variables:
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 8acc000..db15b02 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -2404,11 +2404,14 @@ static void vmx_failed_vmentry(unsigned int exit_reason,
+         printk("reason not known yet!");
+         break;
+     }
+-
++#if defined(XEN_KDB_CONFIG)
++    kdbp("\n************* VMCS Area **************\n");
++    kdb_dump_vmcs(curr->domain->domain_id, (curr)->vcpu_id);
++#else
+     printk("************* VMCS Area **************\n");
+     vmcs_dump_vcpu(curr);
+     printk("**************************************\n");
+-
++#endif
+     domain_crash(curr->domain);
+ }
+ 
+@@ -2714,6 +2717,12 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
+             __vmread(EXIT_QUALIFICATION, &exit_qualification);
+             HVMTRACE_1D(TRAP_DEBUG, exit_qualification);
+             write_debugreg(6, exit_qualification | 0xffff0ff0);
++
++#if defined(XEN_KDB_CONFIG)
++            /* TRAP_debug: IP points correctly to next instr */
++            if (kdb_handle_trap_entry(vector, regs))
++                break;
++#endif 
+             if ( !v->domain->debugger_attached )
+                 vmx_propagate_intr();
+             else
+@@ -2725,6 +2734,14 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
+             if ( v->domain->debugger_attached )
+             {
+                 update_guest_eip(); /* Safe: INT3 */            
++#if defined(XEN_KDB_CONFIG)
++                /*
++                 * vmcs.IP points to bp, kdb expects bp+1. Hence after above
++                 * update_guest_eip which updates to bp+1. works for gdbsx too.
++                 */
++                if (kdb_handle_trap_entry(vector, regs))
++                    break;
++#endif
+                 current->arch.gdbsx_vcpu_event = TRAP_int3;
+                 domain_pause_for_debugger();
+                 break;
+@@ -3039,6 +3056,10 @@ void vmx_vmexit_handler(struct cpu_user_regs *regs)
+     case EXIT_REASON_MONITOR_TRAP_FLAG:
+         v->arch.hvm_vmx.exec_control &= ~CPU_BASED_MONITOR_TRAP_FLAG;
+         vmx_update_cpu_exec_control(v);
++#if defined(XEN_KDB_CONFIG)
++        if (kdb_handle_trap_entry(TRAP_debug, regs))
++            break;
++#endif
+         if ( v->arch.hvm_vcpu.single_step ) {
+           hvm_memory_event_single_step(regs->eip);
+           if ( v->domain->debugger_attached )
+diff --git a/xen/arch/x86/irq.c b/xen/arch/x86/irq.c
+index f77519a..6aa1d5b 100644
+--- a/xen/arch/x86/irq.c
++++ b/xen/arch/x86/irq.c
+@@ -781,7 +781,11 @@ uint8_t alloc_hipriority_vector(void)
+     return next++;
+ }
+ 
++#ifdef XEN_KDB_CONFIG
++void (*direct_apic_vector[NR_VECTORS])(struct cpu_user_regs *);
++#else
+ static void (*direct_apic_vector[NR_VECTORS])(struct cpu_user_regs *);
++#endif
+ void set_direct_apic_vector(
+     uint8_t vector, void (*handler)(struct cpu_user_regs *))
+ {
+@@ -2503,3 +2507,49 @@ bool_t hvm_domain_use_pirq(const struct domain *d, const struct pirq *pirq)
+     return is_hvm_domain(d) && pirq &&
+            pirq->arch.hvm.emuirq != IRQ_UNBOUND; 
+ }
++
++#ifdef XEN_KDB_CONFIG
++void kdb_print_guest_irq_info(int irq)
++{
++    int i;
++    irq_desc_t *desc = irq_to_desc(irq);
++    irq_guest_action_t *action = (irq_guest_action_t *)desc->action;
++
++    for (i = 0; i < action->nr_guests; i++ )
++    {
++        struct domain *dp= action->guest[i];
++        int domid = dp->domain_id;
++        int pirq = domain_irq_to_pirq(dp, irq);
++        struct pirq *pirq_s = pirq_info(dp, domain_irq_to_pirq(dp, irq));
++        int port = pirq_s->evtchn;
++        struct evtchn *chn = evtchn_from_port(dp, port);
++
++        /* domid/pirq/evtchn-port/notify-vcpu */
++        kdbp("%d/%d/%d/%d\n", domid, pirq, port, chn->notify_vcpu_id);
++    }
++}
++
++void kdb_prnt_guest_mapped_irqs(void)
++{
++    int irq, j;
++    char affstr[NR_CPUS/4+NR_CPUS/32+2];    /* courtesy dump_irqs() */
++
++    kdbp("irq  vec  aff  type  domid:mapped-pirq pairs  (all in decimal)\n");
++    for (irq=0; irq < nr_irqs; irq++) {
++        irq_desc_t  *dp = irq_to_desc(irq);
++        struct arch_irq_desc *archp = &dp->arch;
++        irq_guest_action_t *actp = (irq_guest_action_t *)dp->action;
++
++        if (!dp->handler ||dp->handler==&no_irq_type || !(dp->status&IRQ_GUEST))
++            continue;
++
++        cpumask_scnprintf(affstr, sizeof(affstr), dp->affinity);
++        kdbp("[%3ld] %3d %3s %-13s ", irq, archp->vector, affstr,
++             dp->handler->typename);
++        for (j=0; j < actp->nr_guests; j++)
++            kdbp("%03d:%04d ", actp->guest[j]->domain_id,
++                 domain_irq_to_pirq(actp->guest[j], irq));
++        kdbp("\n");
++    }
++}
++#endif
+diff --git a/xen/arch/x86/setup.c b/xen/arch/x86/setup.c
+index cba6cbb..0904d5a 100644
+--- a/xen/arch/x86/setup.c
++++ b/xen/arch/x86/setup.c
+@@ -50,6 +50,13 @@
+ #include <xen/cpu.h>
+ #include <asm/nmi.h>
+ 
++#ifdef XEN_KDB_CONFIG
++#include <asm/debugger.h>
++
++int opt_earlykdb=0;
++boolean_param("earlykdb", opt_earlykdb);
++#endif
++
+ /* opt_nosmp: If true, secondary processors are ignored. */
+ static bool_t __initdata opt_nosmp;
+ boolean_param("nosmp", opt_nosmp);
+@@ -1318,6 +1325,11 @@ void __init __start_xen(unsigned long mbi_p)
+ 
+     trap_init();
+ 
++#ifdef XEN_KDB_CONFIG
++    kdb_init();
++    if (opt_earlykdb)
++        kdb_trap_immed(KDB_TRAP_NONFATAL);
++#endif
+     rcu_init();
+     
+     early_time_init();
+diff --git a/xen/arch/x86/smp.c b/xen/arch/x86/smp.c
+index e828aca..6b9367d 100644
+--- a/xen/arch/x86/smp.c
++++ b/xen/arch/x86/smp.c
+@@ -276,7 +276,7 @@ void smp_send_call_function_mask(const cpumask_t *mask)
+     if ( cpumask_test_cpu(smp_processor_id(), mask) )
+     {
+         local_irq_disable();
+-        smp_call_function_interrupt();
++        smp_call_function_interrupt(NULL);
+         local_irq_enable();
+     }
+ }
+@@ -343,5 +343,5 @@ void call_function_interrupt(struct cpu_user_regs *regs)
+ {
+     ack_APIC_irq();
+     perfc_incr(ipis);
+-    smp_call_function_interrupt();
++    smp_call_function_interrupt(regs);
+ }
+diff --git a/xen/arch/x86/time.c b/xen/arch/x86/time.c
+index 0a1bb96..d369a3d 100644
+--- a/xen/arch/x86/time.c
++++ b/xen/arch/x86/time.c
+@@ -2194,6 +2194,46 @@ static int __init setup_dump_softtsc(void)
+ }
+ __initcall(setup_dump_softtsc);
+ 
++#ifdef XEN_KDB_CONFIG
++void kdb_time_resume(int update_domains)
++{
++        s_time_t now;
++        int ccpu = smp_processor_id();
++        struct cpu_time *t = &this_cpu(cpu_time);
++
++        if (!plt_src.read_counter)            /* not initialized for earlykdb */
++                return;
++
++        if (update_domains) {
++                plt_stamp = plt_src.read_counter();
++                platform_timer_stamp = plt_stamp64;
++                platform_time_calibration();
++                do_settime(get_cmos_time(), 0, read_platform_stime(NULL));
++        }
++        if (local_irq_is_enabled())
++                kdbp("kdb BUG: enabled in time_resume(). ccpu:%d\n", ccpu);
++
++        rdtscll(t->local_tsc_stamp);
++        now = read_platform_stime(NULL);
++        t->stime_master_stamp = now;
++        t->stime_local_stamp  = now;
++
++        update_vcpu_system_time(current);
++
++        if (update_domains)
++                set_timer(&calibration_timer, NOW() + EPOCH);
++}
++
++void kdb_dump_time_pcpu(void)
++{
++    int cpu;
++    for_each_online_cpu(cpu) {
++        kdbp("[%d]: cpu_time: %016lx\n", cpu, &per_cpu(cpu_time, cpu));
++        kdbp("[%d]: cpu_calibration: %016lx\n", cpu, 
++             &per_cpu(cpu_calibration, cpu));
++    }
++}
++#endif
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
+index 60dcc1f..6109cff 100644
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -327,7 +327,7 @@ static void _show_trace(unsigned long sp, unsigned long bp)
+ 
+ #endif
+ 
+-static void show_trace(const struct cpu_user_regs *regs)
++void show_trace(const struct cpu_user_regs *regs)
+ {
+     unsigned long *sp = ESP_BEFORE_EXCEPTION(regs);
+ 
+@@ -3323,6 +3323,10 @@ void do_nmi(const struct cpu_user_regs *regs)
+     if ( nmi_callback(regs, cpu) )
+         return;
+ 
++#ifdef XEN_KDB_CONFIG
++    if (kdb_enabled && kdb_handle_trap_entry(TRAP_nmi, regs))
++        return;
++#endif
+     if ( !nmi_watchdog || (!nmi_watchdog_tick(regs) && watchdog_force) )
+         handle_unknown = 1;
+ 
+diff --git a/xen/arch/x86/x86_64/compat/entry.S b/xen/arch/x86/x86_64/compat/entry.S
+index f337251..9fa918d 100644
+--- a/xen/arch/x86/x86_64/compat/entry.S
++++ b/xen/arch/x86/x86_64/compat/entry.S
+@@ -94,6 +94,10 @@ compat_skip_clobber:
+ ENTRY(compat_test_all_events)
+         ASSERT_NOT_IN_ATOMIC
+         cli                             # tests must not race interrupts
++#ifdef XEN_KDB_CONFIG
++        testl $1, kdb_session_begun(%rip)
++        jnz   compat_restore_all_guest
++#endif
+ /*compat_test_softirqs:*/
+         movl  VCPU_processor(%rbx),%eax
+         shll  $IRQSTAT_shift,%eax
+diff --git a/xen/arch/x86/x86_64/entry.S b/xen/arch/x86/x86_64/entry.S
+index 49c50ae..fff4a30 100644
+--- a/xen/arch/x86/x86_64/entry.S
++++ b/xen/arch/x86/x86_64/entry.S
+@@ -194,6 +194,10 @@ skip_clobber:
+ test_all_events:
+         ASSERT_NOT_IN_ATOMIC
+         cli                             # tests must not race interrupts
++#ifdef XEN_KDB_CONFIG                   /* 64bit dom0 will resume here */
++        testl $1, kdb_session_begun(%rip)
++        jnz   restore_all_guest
++#endif
+ /*test_softirqs:*/  
+         movl  VCPU_processor(%rbx),%eax
+         shll  $IRQSTAT_shift,%eax
+@@ -559,6 +563,13 @@ ENTRY(debug)
+ 
+ ENTRY(int3)
+         pushq $0
++#ifdef XEN_KDB_CONFIG
++        pushq %rax
++        GET_CPUINFO_FIELD(processor_id, %rax)
++        movl  (%rax), %eax
++        lock  bts %eax, kdb_cpu_traps(%rip)
++        popq  %rax
++#endif
+         movl  $TRAP_int3,4(%rsp)
+         jmp   handle_exception
+ 
+diff --git a/xen/common/domain.c b/xen/common/domain.c
+index bd9da92..4125a5e 100644
+--- a/xen/common/domain.c
++++ b/xen/common/domain.c
+@@ -693,6 +693,14 @@ void domain_shutdown(struct domain *d, u8 reason)
+ {
+     struct vcpu *v;
+ 
++#ifdef XEN_KDB_CONFIG
++    if (reason == SHUTDOWN_crash) {
++        if ( is_hardware_domain(d) )
++            kdb_trap_immed(KDB_TRAP_FATAL);
++        else
++            kdb_trap_immed(KDB_TRAP_NONFATAL);
++    }
++#endif
+     spin_lock(&d->shutdown_lock);
+ 
+     if ( d->shutdown_code == -1 )
+diff --git a/xen/common/sched_credit.c b/xen/common/sched_credit.c
+index e3d13c2..013197a 100644
+--- a/xen/common/sched_credit.c
++++ b/xen/common/sched_credit.c
+@@ -1764,6 +1764,33 @@ csched_dump_vcpu(struct csched_vcpu *svc)
+     printk("\n");
+ }
+ 
++#ifdef XEN_KDB_CONFIG
++static void kdb_csched_dump(int cpu)
++{
++    struct csched_pcpu *pcpup = CSCHED_PCPU(cpu);
++    struct vcpu *scurrvp = (CSCHED_VCPU(current))->vcpu;
++    struct list_head *tmp, *runq = RUNQ(cpu);
++
++    kdbp("    csched_pcpu: %p\n", pcpup);
++    kdbp("    curr csched:%p {vcpu:%p id:%d domid:%d}\n", (current)->sched_priv,
++         scurrvp, scurrvp->vcpu_id, scurrvp->domain->domain_id);
++    kdbp("    runq:\n");
++
++    /* next is top of struct, so screw stupid, ugly hard to follow macros */
++    if (offsetof(struct csched_vcpu, runq_elem.next) != 0) {
++        kdbp("next is not first in struct csched_vcpu. please fixme\n");
++        return;        /* otherwise for loop will crash */
++    }
++    for (tmp = runq->next; tmp != runq; tmp = tmp->next) {
++
++        struct csched_vcpu *csp = (struct csched_vcpu *)tmp;
++        struct vcpu *vp = csp->vcpu;
++        kdbp("      csp:%p pri:%02d vcpu: {p:%p id:%d domid:%d}\n", csp,
++             csp->pri, vp, vp->vcpu_id, vp->domain->domain_id);
++    };
++}
++#endif
++
+ static void
+ csched_dump_pcpu(const struct scheduler *ops, int cpu)
+ {
+@@ -1773,6 +1800,10 @@ csched_dump_pcpu(const struct scheduler *ops, int cpu)
+     int loop;
+ #define cpustr keyhandler_scratch
+ 
++#ifdef XEN_KDB_CONFIG
++    kdb_csched_dump(cpu);
++    return;
++#endif
+     spc = CSCHED_PCPU(cpu);
+     runq = &spc->runq;
+ 
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 1a8c518..5474d10 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -1537,6 +1537,25 @@ void wait(void)
+     schedule();
+ }
+ 
++#ifdef XEN_KDB_CONFIG
++void kdb_print_sched_info(void)
++{
++    int cpu;
++
++    kdbp("Scheduler: name:%s opt_name:%s id:%d\n", ops.name, ops.opt_name,
++         ops.sched_id);
++    kdbp("per cpu schedule_data:\n");
++    for_each_online_cpu(cpu) {
++        struct schedule_data *p =  &per_cpu(schedule_data, cpu);
++        kdbp("  cpu:%d  &(per cpu)schedule_data:%p\n", cpu, p);
++        kdbp("         curr:%p sched_priv:%p\n", p->curr, p->sched_priv);
++        kdbp("\n");
++        ops.dump_cpu_state(&ops, cpu);
++        kdbp("\n");
++    }
++}
++#endif
++
+ #ifdef CONFIG_COMPAT
+ #include "compat/schedule.c"
+ #endif
+diff --git a/xen/common/smp.c b/xen/common/smp.c
+index 482a203..6937108 100644
+--- a/xen/common/smp.c
++++ b/xen/common/smp.c
+@@ -75,7 +75,7 @@ out:
+     spin_unlock(&call_lock);
+ }
+ 
+-void smp_call_function_interrupt(void)
++void smp_call_function_interrupt(struct cpu_user_regs *regs)
+ {
+     void (*func)(void *info) = call_data.func;
+     void *info = call_data.info;
+@@ -96,6 +96,11 @@ void smp_call_function_interrupt(void)
+     {
+         smp_mb();
+         cpumask_clear_cpu(cpu, &call_data.selected);
++#ifdef XEN_KDB_CONFIG
++        if (info && !strcmp(info, "XENKDB"))             /* called from kdb */
++            (*(void (*)(struct cpu_user_regs *, void *))func)(regs, info);
++        else
++#endif
+         (*func)(info);
+     }
+ 
+diff --git a/xen/common/symbols.c b/xen/common/symbols.c
+index 12765d3..807b924 100644
+--- a/xen/common/symbols.c
++++ b/xen/common/symbols.c
+@@ -260,6 +260,24 @@ unsigned long symbols_lookup_by_name(const char *symname)
+     return 0;
+ }
+ 
++#ifdef XEN_KDB_CONFIG
++/*
++ *  * Given a symbol, return its address
++ *   */
++unsigned long address_lookup(char *symp)
++{
++    int i, off = 0;
++    char namebuf[KSYM_NAME_LEN+1];
++
++    for (i=0; i < symbols_num_syms; i++) {
++        off = symbols_expand_symbol(off, namebuf);
++        if (strcmp(namebuf, symp) == 0)                  /* found it */
++            return symbols_address(i);
++    }
++    return 0;
++}
++#endif
++
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/xen/common/timer.c b/xen/common/timer.c
+index f36aebc..6b4374d 100644
+--- a/xen/common/timer.c
++++ b/xen/common/timer.c
+@@ -642,6 +642,48 @@ void __init timer_init(void)
+     register_keyhandler('a', &dump_timerq_keyhandler);
+ }
+ 
++#ifdef XEN_KDB_CONFIG
++#include <xen/symbols.h>
++void kdb_dump_timer_queues(void)
++{
++    struct timer  *t;
++    struct timers *ts;
++    unsigned long sz, offs;
++    char buf[KSYM_NAME_LEN+1];
++    int cpu, j;
++    u64 tsc;
++
++    for_each_online_cpu( cpu )
++    {
++        ts = &per_cpu(timers, cpu);
++        kdbp("CPU[%02d]:", cpu);
++
++        if (cpu == smp_processor_id()) {
++            s_time_t now = NOW();
++            rdtscll(tsc);
++            kdbp("NOW:0x%08x%08x TSC:0x%016lx\n", (u32)(now>>32),(u32)now, tsc);
++        } else
++            kdbp("\n");
++
++        /* timers in the heap */
++        for ( j = 1; j <= GET_HEAP_SIZE(ts->heap); j++ ) {
++            t = ts->heap[j];
++            kdbp("  %d: exp=0x%08x%08x fn:%s data:%p\n",
++                 j, (u32)(t->expires>>32), (u32)t->expires,
++                 symbols_lookup((unsigned long)t->function, &sz, &offs, buf),
++                 t->data);
++        }
++        /* timers on the link list */
++        for ( t = ts->list, j = 0; t != NULL; t = t->list_next, j++ ) {
++            kdbp(" L%d: exp=0x%08x%08x fn:%s data:%p\n",
++                 j, (u32)(t->expires>>32), (u32)t->expires,
++                 symbols_lookup((unsigned long)t->function, &sz, &offs, buf),
++                 t->data);
++        }
++    }
++}
++#endif
++
+ /*
+  * Local variables:
+  * mode: C
+diff --git a/xen/drivers/char/console.c b/xen/drivers/char/console.c
+index 9d14604..55f0473 100644
+--- a/xen/drivers/char/console.c
++++ b/xen/drivers/char/console.c
+@@ -347,6 +347,21 @@ static void serial_rx(char c, struct cpu_user_regs *regs)
+ {
+     static int switch_code_count = 0;
+ 
++#ifdef XEN_KDB_CONFIG
++    /* if ctrl-\ pressed and kdb handles it, return */
++    if (kdb_enabled && c == 0x1c) {
++        if (!kdb_session_begun) {
++            if (kdb_keyboard(regs))
++                return;
++        } else {
++            kdbp("Sorry... kdb session already active....\n");
++            return;
++        }
++    }
++    if (kdb_session_begun)      /* kdb should already be polling */
++        return;                 /* swallow chars so they don't buffer in dom0 */
++#endif
++
+     if ( switch_code && (c == switch_code) )
+     {
+         /* We eat CTRL-<switch_char> in groups of 3 to switch console input. */
+@@ -815,6 +830,18 @@ void console_end_sync(void)
+     atomic_dec(&print_everything);
+ }
+ 
++#ifdef XEN_KDB_CONFIG
++void console_putc(char c)
++{
++    serial_putc(sercon_handle, c);
++}
++
++int console_getc(void)
++{
++    return serial_getc(sercon_handle);
++}
++#endif
++
+ /*
+  * printk rate limiting, lifted from Linux.
+  *
+diff --git a/xen/include/asm-x86/debugger.h b/xen/include/asm-x86/debugger.h
+index 0408bec..5bc1360 100644
+--- a/xen/include/asm-x86/debugger.h
++++ b/xen/include/asm-x86/debugger.h
+@@ -39,7 +39,11 @@
+ #define DEBUGGER_trap_fatal(_v, _r) \
+     if ( debugger_trap_fatal(_v, _r) ) return;
+ 
+-#if defined(CRASH_DEBUG)
++#if defined(XEN_KDB_CONFIG)
++#define debugger_trap_immediate() kdb_trap_immed(KDB_TRAP_NONFATAL)
++#define debugger_trap_fatal(_v, _r) kdb_trap_fatal(_v, _r)
++
++#elif defined(CRASH_DEBUG)
+ 
+ #include <xen/gdbstub.h>
+ 
+@@ -70,6 +74,10 @@ static inline int debugger_trap_entry(
+ {
+     struct vcpu *v = current;
+ 
++#ifdef XEN_KDB_CONFIG
++    if (kdb_handle_trap_entry(vector, regs))
++        return 1;
++#endif
+     if ( guest_kernel_mode(v, regs) && v->domain->debugger_attached &&
+          ((vector == TRAP_int3) || (vector == TRAP_debug)) )
+     {
+diff --git a/xen/include/xen/lib.h b/xen/include/xen/lib.h
+index 1066757..2e0f417 100644
+--- a/xen/include/xen/lib.h
++++ b/xen/include/xen/lib.h
+@@ -141,4 +141,7 @@ void init_constructors(void);
+ 
+ void *current_text_addr(void);
+ 
++#ifdef XEN_KDB_CONFIG
++#include "../../kdb/include/kdb_extern.h"
++#endif
+ #endif /* __LIB_H__ */
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index d8006bb..ef72779 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -700,11 +700,14 @@ extern void (*dead_idle) (void);
+ unsigned long hypercall_create_continuation(
+     unsigned int op, const char *format, ...);
+ void hypercall_cancel_continuation(void);
+-
++#ifdef XEN_KDB_CONFIG
++#define hypercall_preempt_check() (0)
++#else
+ #define hypercall_preempt_check() (unlikely(    \
+         softirq_pending(smp_processor_id()) |   \
+         local_events_need_delivery()            \
+     ))
++#endif
+ 
+ extern struct domain *domain_list;
+ 
+diff --git a/xen/include/xen/smp.h b/xen/include/xen/smp.h
+index 6febb56..3aa8a6c 100644
+--- a/xen/include/xen/smp.h
++++ b/xen/include/xen/smp.h
+@@ -61,7 +61,7 @@ static inline void on_each_cpu(
+ /*
+  * Call a function on the current CPU
+  */
+-void smp_call_function_interrupt(void);
++void smp_call_function_interrupt(struct cpu_user_regs *regs);
+ 
+ void smp_send_call_function_mask(const cpumask_t *mask);
+ 

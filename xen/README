@@ -1,0 +1,19 @@
+
+following fix in kdb-444-155.patch, but not others. check.
+
++++ b/xen/arch/x86/x86_64/entry.S
+@@ -566,8 +566,8 @@ ENTRY(int3)
+ #ifdef XEN_KDB_CONFIG
+         pushq %rax
+         GET_CPUINFO_FIELD(processor_id, %rax)
+-        movq  (%rax), %rax
+-        lock  bts %rax, kdb_cpu_traps(%rip)
++        movl  (%rax), %eax
++        lock  bts %eax, kdb_cpu_traps(%rip)
+         popq  %rax
+ #endif
+         movl  $TRAP_int3,4(%rsp)
+
+
+
+

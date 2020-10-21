@@ -1,0 +1,243 @@
+
+Welcome to kdb for xen, a hypervisor built in debugger.
+
+FEATURES:
+   - set breakpoints in hypervisor
+   - examine virt/machine memory, registers, domains, vcpus, etc...
+   - single step, single step till jump/call, step over call to next
+     instruction after the call.
+   - examine memory of a PV/HVM guest. 
+   - set breakpoints, single step, etc... for a PV guest.
+   - breaking into the debugger will freeze the system, all CPUs will pause,
+     no interrupts are acknowledged in the debugger. (Hence, the wall clock
+     will drift)
+   - single step will step only that cpu.
+   - earlykdb: break into kdb very early during boot. Put "earlykdb" on the
+               xen command line in grub.conf.
+   - generic tracing functions (see below) for quick tracing to debug timing
+     related problems. To use:
+        o set KDBTRCMAX to max num of recs in circular trc buffer in kdbmain.c
+	o call kdb_trc() from anywhere in xen
+	o turn tracing on by setting kdb_trcon in kdbmain.c or trcon command.
+	o trcp in kdb will give hints to dump trace recs. Use dd to see buffer
+	o trcz will zero out the entire buffer if needed.
+
+NOTE:
+   - since almost all numbers are in hex, 0x is not prefixed. Instead, decimal
+     numbers are preceded by $, as in $17 (sorry, one gets used to it). Note,
+     vcpu num, cpu num, domid are always displayed in decimal, without $.
+   - watchdog must be disabled to use kdb
+
+ISSUES:
+   - Currently, debug hypervisor is not supported. Make sure NDEBUG is defined
+     or compile with debug=n
+   - "timer went backwards" messages on dom0, but kdb/hyp should be fine.
+     I usually do "echo 2 > /proc/sys/kernel/printk" when using kdb.
+   - 32bit hypervisor may hang. Tested on 64bit hypervisor only.
+    
+
+TO BUILD:
+ - do >make kdb=y
+
+HOW TO USE:
+  1. A serial line is needed to use the debugger. Set up a serial line
+     from the source machine to target victim. Make sure the serial line
+     is working properly by displaying login prompt and loging in etc....
+
+  2. Add following to grub.conf:
+        kernel /xen.kdb console=com1,vga com1=57600,8n1 dom0_mem=542M
+
+        (57600 or whatever used in step 1 above)
+
+  3. Boot the hypervisor built with the debugger. 
+
+  4. ctrl-\ (ctrl and backslash) will break into the debugger. If the system is
+     badly hung, pressing NMI would also break into it. However, once kdb is
+     entered via NMI, normal execution can't continue.
+
+  5. type 'h' for list of commands.
+
+  6. Command line editing is limited to backspace. ctrl-c to start a new cmd.
+
+
+
+GUEST debug:
+  - type sym in the debugger
+  - for REL4, grep kallsyms_names, kallsyms_addresses, and kallsyms_num_syms
+    in the guest System.map* file. Run sym again with domid and the three
+    values on the command line.
+  - Now basic symbols can be used for guest debug. Note, if the binary is not
+    built with symbols, only function names are available, but not global vars.
+
+    Eg: sym 0 c0696084 c068a590 c0696080 c06b43e8 c06b4740
+        will set symbols for dom 0. Then :
+
+        [4]xkdb> bp some_function 0
+
+	wills set bp at some_function in dom 0
+
+	[3]xkdb> dw c068a590 32 0 : display 32 bytes of dom0 memory
+
+
+Tips:
+  - In "[0]xkdb>"  : 0 is the cpu number in decimal
+  - In
+      00000000c042645c: 0:do_timer+17                  push %ebp
+    0:do_timer : 0 is the domid in hex
+    offset +17 is in hex.
+
+    absense of 0: would indicate it's a hypervisor function
+
+  - commands starting with kdb (kdb*) are for kdb debug only.
+
+
+Finally,
+ - think hex.
+ - bug/problem: enter kdbdbg, reproduce, and send me the output.
+   If the output is not enough, I may ask to run kdbdbg twice, then collect
+   output.
+
+
+Thanks,
+Mukesh Rathor
+Oracle Corporatin, 
+Redwood Shores, CA 94065
+
+--------------------------------------------------------------------------------
+COMMAND DESCRIPTION:
+
+info:  Print basic info like version, compile flags, etc..
+
+cur:  print current domain id and vcpu id
+
+f: display current stack. If a vcpu ptr is given, then print stack for that
+   VCPU by using its IP and SP.
+
+fg: display stack for a guest given domid, SP and IP.
+
+dw: display words of memory. 'num' of bytes is optional, but if displaying guest
+    memory, then is required.
+
+dd: same as above, but display doublewords.
+
+dwm: same as above but the address is machine address instead of virtual.
+
+ddm: same as above, but display doublewords.
+
+dr: display registers. if 'sp' is specified then print few extra registers.
+
+drg: display guest context saved on stack bottom.
+
+dis: disassemble instructions. If disassembling for guest, then 'num' must
+     be specified. 'num' is number of instrs to display.
+
+dism: toggle disassembly mode between Intel and ATT/GAS.
+
+mw: modify word in memory given virtual address. 'domid' may be specified if
+    modifying guest memory. value is assumed in hex even without 0x.
+
+md: same as above but modify doubleword.
+
+mr: modify register. value is assumd hex.
+
+bc: clear given or all breakpoints
+
+bp: display breakpoints or set a breakpoint. Domid may be specified to set a bp
+    in guest. kdb functions may not be specified if debugging kdb.
+    Example:
+      xkdb> bp acpi_processor_idle  : will set bp in xen
+      xkdb> bp default_idle 0 :   will set bp in domid 0
+      xkdb> bp idle_cpu 9 :   will set bp in domid 9
+
+     Conditions may be specified for a bp: lhs == rhs or lhs != rhs
+     where : lhs is register like 'r6', 'rax', etc...  or memory location
+             rhs is hex value with or without leading 0x.
+     Thus,
+      xkdb> bp acpi_processor_idle rdi == c000 
+      xkdb> bp 0xffffffff80062ebc 0 rsi == ffff880021edbc98 : will break into
+            kdb at 0xffffffff80062ebc in dom0 when rsi is ffff880021edbc98 
+
+btp: break point trace. Upon bp, print some info and continue without stopping.
+   Ex: btp idle_cpu 7 rax rbx 0x20ef5a5 r9
+
+   will print: rax, rbx, *(long *)0x20ef5a5, r9 upon hitting idle_cpu() and 
+               continue.
+
+wp: set a watchpoint at a virtual address which can belong to hypervisor or
+    any guest. Do not specify wp in kdb path if debugging kdb.
+
+wc: clear given or all watchpoints.
+
+ni: single step, stepping over function calls.
+
+ss: single step. Be carefull when in interrupt handlers or context switches.
+    
+ssb: single step to branch. Use with care.
+
+go: leave kdb and continue.
+
+cpu: go back to orig cpu when entering kdb. If 'cpu number' given, then switch 
+     to that cpu. If 'all' then show status of all cpus.
+
+nmi: Only available in hung/crash state. Send NMI to a cpu that may be hung.
+
+sym: Initialize a symbol table for debugging a guest. Look into the System.map
+     file of guest for certain symbol values and provide them here.
+
+vcpuh: Given vcpu ptr, display hvm_vcpu struct.
+
+vcpu: Display current vcpu struct. If 'vcpu-ptr' given, display that vcpu.
+
+dom: display current domain. If 'domid' then display that domid. If 'all', then
+     display all domains.
+
+sched: show schedular info and run queues.
+
+mmu: print basic mmu info
+
+p2m: convert a gpfn to mfn given a domid. value in hex even without 0x.
+
+m2p: convert mfn to pfn. value in hex even without 0x.
+
+dpage: display struct page given a mfn or struct page ptr. Since, no info is 
+       kept on page type, we display all possible page types.
+
+dtrq: display timer queues.
+
+didt: dump IDT table.
+
+dgt: dump GDT table.
+
+dirq: display IRQ bindings.
+
+dvmc: display all or given dom/vcpu VMCS or VMCB.
+
+trcon: turn tracing on. Trace hooks must be added in xen and kdb function
+       called directly from there.
+
+trcoff: turn tracing off.
+
+trcz: zero trace buffer.
+
+trcp: give hints to print the circular trace buffer, like current active ptr.
+
+usr1: allows to add any arbitraty command quickly.
+
+--------------------------------------------------------------------------------
+/*
+ * Copyright (C) 2008 Oracle.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
