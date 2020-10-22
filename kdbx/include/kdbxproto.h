@@ -17,7 +17,15 @@
 #ifndef _KDBPROTO_H
 #define _KDBPROTO_H
 
+extern struct list_head vm_list;
+extern struct boot_params boot_params;
+extern struct super_block *blockdev_superblock;
+extern struct class block_class;
+
+
 struct vmcs;
+struct virtio_blk;
+struct virtio_scsi;
 
 /* kdbx interfaces in linux files */
 #ifdef CONFIG_KDBX_FOR_XEN_DOM0
@@ -32,7 +40,11 @@ extern void kdbx_display_vvmx(struct kvm_vcpu *vp);
 extern ulong kdbx_get_vmcs_field(struct kvm_vcpu *vp, uint field);
 extern void kdbx_ret_curr_vcpu_info(struct kvm_vcpu **vpp, struct vmcs **vmcspp,
                                     struct vmcs **vmxapp);
-void kvm_disp_ioeventfds(struct kvm *kp);
+extern void kvm_disp_ioeventfds(struct kvm *kp);
+extern void kdbx_disp_virtio_scsi(struct virtio_scsi *);
+extern void kdbx_disp_virtq(struct virtqueue *vq);
+extern void kdbx_disp_virtio_blk(struct virtio_blk *);
+extern struct bus_type *kdbx_ret_virtio_bus_addr(void);
 
 
 /* linux interfaces used by kdbx */
@@ -50,6 +62,8 @@ extern volatile int kdbx_trcon;
 /* kdbx interfaces */
 extern void kdbx_init_cmdtab(void);
 extern void kdbx_do_cmds(struct pt_regs *);
+extern kdbx_cpu_cmd_t kdbx_call_cmd_func(int, const char **, struct pt_regs *, 
+                                         kdbx_func_t);
 extern int kdbx_check_sw_bkpts(struct pt_regs *);
 extern int kdbx_check_watchpoints(struct pt_regs *);
 extern void kdbx_do_watchpoints(kdbva_t, int, int);
@@ -74,13 +88,15 @@ extern int kdbx_is_addr_guest_text(ulong addr, pid_t gpid);
 extern kdbva_t kdbx_guest_sym2addr(char *p, pid_t gpid);
 extern char *kdbx_guest_addr2sym(unsigned long addr, pid_t gpid, ulong *offsp);
 extern void kdbx_sav_guest_syminfo(pid_t, ulong, ulong, ulong, ulong, ulong,
-                                   ulong, ulong);
+                                   ulong, ulong, ulong);
 extern int kdbx_guest_bitness(pid_t gpid);
 extern struct kvm_vcpu *kdbx_pid_to_vcpu(pid_t pid, int pr_err);
 extern void kdbx_vcpu_to_ptregs(struct kvm_vcpu *vp, struct pt_regs *regs);
 extern void kdbx_ptregs_to_vcpu(struct kvm_vcpu *vp, struct pt_regs *regs);
 extern pid_t kdbx_pid2tgid(pid_t pid);
 extern int kdbx_guest_sym_loaded(pid_t gpid);
+extern void kdbx_show_cur(struct pt_regs *regs);
+extern void kdbx_cpu_relax(void);
 
 extern void kdbx_install_all_swbp(void);
 extern void kdbx_uninstall_all_swbp(void);
@@ -92,5 +108,6 @@ extern ulong kdbx_p2m(struct kvm_vcpu *vp, ulong gfn);
 
 extern void kdbx_trczero(void);
 extern void kdbx_trcp(void);
+extern void kdbg_trcp(void);
 
 #endif /* !_KDBPROTO_H */

@@ -30,7 +30,10 @@
 #include <asm/desc_defs.h>
 #include <asm/desc.h>
 #include <asm/bootparam.h>
+#include <asm/apic.h>
+#include <asm/smp.h>
 #include <linux/tty.h>
+#include <linux/tty_flip.h>
 #include <linux/console.h>
 #include <linux/vt_kern.h>
 #include <linux/ctype.h>
@@ -91,11 +94,14 @@
 #include <linux/skbuff.h>
 #include <linux/tcp.h>
 #include <linux/virtio_config.h>
+#include <linux/virtio_ids.h>
+#include "../drivers/virtio/virtio_pci_common.h"
 #include <net/ip.h>
 #include <linux/platform_device.h>
 #include <linux/serial_8250.h>
 #include <asm/serial.h>
 #include <kvm/iodev.h>
+#include <scsi/scsi_host.h>
 #include "../../kernel/sched/sched.h"
 #include "../drivers/tty/serial/8250/8250.h"
 #include "../drivers/vhost/vhost.h"

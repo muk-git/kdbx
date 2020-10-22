@@ -16,8 +16,10 @@
  * Boston, MA 021110-1307, USA.
  */
 
-#ifndef _KDBDEFS_H
-#define _KDBDEFS_H
+#ifndef _KDBXDEFS_H
+#define _KDBXDEFS_H
+
+#define KDBX_GUEST_MODE_BIT 63       /* use this to indicate guest mode */
 
 typedef unsigned long kdbva_t;
 typedef unsigned char kdbbyt_t;
@@ -39,12 +41,13 @@ typedef enum {
     KDB_CPU_PAUSE,       /*  2: cpu is paused */
     KDB_CPU_DISABLE,     /*  3: disable interrupts */
     KDB_CPU_SHOWPC,      /*  4: all cpus must display their pc */
-    KDB_CPU_DO_VMEXIT,   /*  5: all cpus must do vmcs vmexit. intel only */
-    KDB_CPU_MAIN_KDB,    /*  6: cpu in kdb main command loop */
-    KDB_CPU_GO,          /*  7: user entered go for this cpu */
-    KDB_CPU_SS,          /*  8: single step for this cpu */
-    KDB_CPU_NI,          /*  9: go to next instr after the call instr */
-    KDB_CPU_INSTALL_BP,  /* 10: delayed install of sw bp(s) by this cpu */
+    KDB_CPU_SHOW_CUR,    /*  5: all cpus must display their current task */
+    KDB_CPU_DO_VMEXIT,   /*  6: all cpus must do vmcs vmexit. intel only */
+    KDB_CPU_MAIN_KDB,    /*  7: cpu in kdb main command loop */
+    KDB_CPU_GO,          /*  8: user entered go for this cpu */
+    KDB_CPU_SS,          /*  9: single step for this cpu */
+    KDB_CPU_NI,          /* 10: go to next instr after the call instr */
+    KDB_CPU_INSTALL_BP,  /* 11: delayed install of sw bp(s) by this cpu */
 } kdbx_cpu_cmd_t;
 
 /* ============= kdb commands ============================================= */
@@ -53,18 +56,17 @@ typedef kdbx_cpu_cmd_t (*kdbx_func_t)(int, const char **, struct pt_regs *);
 typedef kdbx_cpu_cmd_t (*kdbx_usgf_t)(void);
 
 typedef enum {
-    KDB_REPEAT_NONE = 0,    /* Do not repeat this command */
-    KDB_REPEAT_NO_ARGS,     /* Repeat the command without arguments */
-    KDB_REPEAT_WITH_ARGS,   /* Repeat the command including its arguments */
-} kdb_repeat_t;
+    KDBX_REPEAT_NONE = 0,    /* Do not repeat this command */
+    KDBX_REPEAT_NO_ARGS,     /* Repeat the command without arguments */
+} kdbx_repeat_t;
 
-typedef struct _kdbtab {
-    char        *kdb_cmd_name;        /* Command name */
+struct kdbxtab {
+    char         *kdb_cmd_name;       /* Command name */
     kdbx_func_t   kdb_cmd_func;       /* ptr to function to execute command */
     kdbx_usgf_t   kdb_cmd_usgf;       /* usage function ptr */
-    int          kdb_cmd_crash_avail; /* available in sys fatal/crash state */
-    kdb_repeat_t kdb_cmd_repeat;      /* Does command auto repeat on enter? */
-} kdbtab_t;
+    int           kdb_cmd_crash_avail;/* available in sys fatal/crash state */
+    kdbx_repeat_t kdb_cmd_repeat;     /* Does command auto repeat on enter? */
+};
 
 
 /* ============= types and stuff ========================================= */
@@ -89,10 +91,11 @@ extern volatile int kdbdbg;
 
 #define ASSERT(x) {                                                     \
     if (!(x)) {                                                         \
-        kdbxp("ASSERT %s FAILED: %s:%d\n", #x, __func__, __LINE__);      \
+        kdbxp("[%d]ASSERT %s FAILED: %s:%d\n", smp_processor_id(), #x,  \
+              __func__,__LINE__);                                       \
     }                                                                   \
 }
 
 #define irqs_enabled() (!irqs_disabled())
 
-#endif  /* !_KDBDEFS_H */
+#endif  /* !_KDBXDEFS_H */

@@ -15,6 +15,7 @@ struct vhost_dev;
 extern int earlykdbx;
 extern volatile int kdbx_session_begun;
 
+char *kdbx_hostsym(void *addr);
 void kdbxp(char *fmt, ...);
 void kdbx_init(char *boot_command_line);
 int kdbx_handle_trap_entry(int vector, const struct pt_regs *regs1);
@@ -27,10 +28,11 @@ void kdbx_switch_to_tty(void);
 void mukchk(unsigned long);
 int mukadd(int i, uint *p);
 ulong mukaddl(int i, ulong *p);
+int kdbx_excp_fixup(struct pt_regs *regs);
 
-void kdbx_do_nmi(struct pt_regs *regs, int err_code);
+void kdbx_do_nmi(struct pt_regs *regs);
 void kdbx_dump_uart(void);
-void kdbx_show_stack(struct pt_regs *regs, pid_t pid);
+void kdbx_show_stack(struct pt_regs *regs, pid_t pid, int);
 void kdbx_print_regs(struct pt_regs *regs);
 int kdbx_kernel_printk(char *fmt, va_list args);
 void kdbx_sav_vhost_dev(struct vhost_dev *dev, char *type);

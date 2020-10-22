@@ -28,10 +28,10 @@ int kdbx_read_mmem(kdbma_t maddr, kdbbyt_t *dbuf, int len)
     while (len > 0) {
         ulong pagecnt = min_t(long, PAGE_SIZE - (maddr & ~PAGE_MASK), len);
         struct page *pg = pfn_to_page(maddr >> PAGE_SHIFT);
-        char *va = kmap(pg);
+        char *va = page_to_virt(pg); /* don't kmap(), it calls _cond_resched */
 
         if ( pg == NULL || va == NULL ) {
-            kdbxp("kdbx: unable to kmap maddr:%016lx\n", maddr);
+            kdbxp("kdbx: unable to map maddr:%016lx\n", maddr);
             break;
         }
 
@@ -39,7 +39,6 @@ int kdbx_read_mmem(kdbma_t maddr, kdbbyt_t *dbuf, int len)
         memcpy(dbuf, (void *)va, pagecnt);
 
         KDBGP1("maddr:%x va:%p len:%x pagecnt:%x\n", maddr, va, len, pagecnt );
-        kunmap(pg);
 
         len = len  - pagecnt;
         maddr += pagecnt;
@@ -65,10 +64,12 @@ static int kdb_early_wmem(kdbva_t daddr, kdbbyt_t *sbuf, int len)
  * returns: 0 if failed (or entry could be 0 also) */
 static ulong kdb_lookup_pt_entry(ulong gfn, int idx, struct kvm_vcpu *vp)
 {
+    char *va;
     ulong rval;
     ulong pfn = kdbx_p2m(vp, gfn);
     struct page *pg = pfn_valid(pfn) ? pfn_to_page(pfn) : NULL;
-    char *va = pg ? kmap(pg) : NULL;
+
+    va = pg ? page_to_virt(pg):NULL;  /* don't kmap(), it calls _cond_resched */
 
     KDBGP1("lookup e: gfn:%lx pfn:%lx idx:%x va:%p\n", gfn, pfn, idx, va);
     if ( !pfn_valid(pfn) ) {
@@ -84,7 +85,6 @@ static ulong kdb_lookup_pt_entry(ulong gfn, int idx, struct kvm_vcpu *vp)
 
     va += idx * 8;
     rval = *(ulong *)va;
-    kunmap(pg);
     KDBGP1("lookup e: return entry:%lx\n", rval);
 
     return rval;
@@ -146,9 +146,10 @@ static ulong kdb_pt_pfn(ulong addr, ulong cr3gfn, struct kvm_vcpu *vp,
         kdbxp("pte is not present. entry:%lx\n", entry);
         return (ulong)-1;
     }
+    gfn = (entry & PTE_PFN_MASK) >> PAGE_SHIFT;
 
 out:
-    KDBGP1("kdb_pt_pfn: for addr: %lx data gfn:%lx\n", addr, gfn);
+    KDBGP1("kdb_pt_pfn: addr: %lx gfn:%lx level:%d\n", addr, gfn, *levelp);
     return kdbx_p2m(vp, gfn);
 }
 
@@ -171,10 +172,13 @@ static int kdb_rw_cr3_mem(kdbva_t addr, kdbbyt_t *buf, int len,
            len, toaddr, cr3gfn);
 
     while (len > 0) {
+        char *va;
         ulong pagecnt = min_t(long, PAGE_SIZE - (addr & ~PAGE_MASK), len);
         ulong pfn = kdb_pt_pfn(addr, cr3gfn, vp, &level);  /* pfn is mfn */
         struct page *pg = pfn ? (pfn_valid(pfn) ? pfn_to_page(pfn) : NULL):NULL;
-        char *va = pg ? kmap(pg) : NULL;
+
+        /* don't kmap(), it calls _cond_resched */
+        va = pg ? page_to_virt(pg) : NULL;  
 
         if ( pfn == 0 || !pfn_valid(pfn) ) {
             kdbxp("kdb_rw_cr3_mem: addr:%lx len:%d. pfn:%lx invalid\n", 
@@ -182,7 +186,7 @@ static int kdb_rw_cr3_mem(kdbva_t addr, kdbbyt_t *buf, int len,
             break;
         }
         if ( pg == NULL || va == NULL ) {
-            kdbxp("kdbx: unable to kmap addr:%016lx pfn:%lx\n", addr, pfn);
+            kdbxp("kdbx: unable to map addr:%016lx pfn:%lx\n", addr, pfn);
             break;
         }
 
@@ -207,7 +211,6 @@ static int kdb_rw_cr3_mem(kdbva_t addr, kdbbyt_t *buf, int len,
             memcpy(buf, va, pagecnt);
 
         KDBGP1("addr:%lx va:%p len:%x pagecnt:%x\n", addr, va, len, pagecnt );
-        kunmap(pg);
 
         len = len  - pagecnt;
         addr += pagecnt;

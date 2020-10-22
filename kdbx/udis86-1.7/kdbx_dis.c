@@ -47,14 +47,15 @@ static int kdb_read_byte_for_ud(struct ud *udp)
 
 /* convert addr to symbol and return in buf
  * if gpid == -1, just return addr in buf
- * NOTE: buf size must be KSYM_NAME_LEN+16 (for guestpid prefix) */
+ * NOTE: buf size must be KSYM_NAME_LEN+16 (for guestpid prefix) 
+ */
 char *kdbx_addr2sym(pid_t gpid, kdbva_t addr, char *buf, int needoffs)
 {
     unsigned long sz, offs, symfound = 0;
     char prefix[8], *p = buf;
 
     prefix[0] = '\0';     /* guest pid */
-    snprintf(buf, KSYM_NAME_LEN+16, " (null) ");
+    // snprintf(buf, KSYM_NAME_LEN+16, " (null) ");
 
     if ( gpid != -1 && addr ) {
         if ( gpid ) {
@@ -73,9 +74,12 @@ char *kdbx_addr2sym(pid_t gpid, kdbva_t addr, char *buf, int needoffs)
             snprintf(buf, KSYM_NAME_LEN+16, "%s%s+%lx", prefix, p, offs);
         else
             snprintf(buf, KSYM_NAME_LEN+16, "%s%s", prefix, p);
-    } else
-        snprintf(buf, KSYM_NAME_LEN+16, " %s%016lx ", prefix, addr);
-
+    } else {
+        if ( addr )
+            snprintf(buf, KSYM_NAME_LEN+16, " %s%016lx ", prefix, addr);
+        else
+            buf[0] = '\0';
+    }
     return buf;
 }
 
