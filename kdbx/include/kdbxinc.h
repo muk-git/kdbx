@@ -32,6 +32,8 @@
 #include <asm/bootparam.h>
 #include <asm/apic.h>
 #include <asm/smp.h>
+#include <asm/page.h>
+#include <asm/timer.h>
 #include <linux/tty.h>
 #include <linux/tty_flip.h>
 #include <linux/console.h>
@@ -60,6 +62,8 @@
 #include <linux/suspend.h>
 #include <linux/pagevec.h>
 #include <linux/blkdev.h>
+#include <linux/blk-mq.h>
+#include <linux/blk_types.h>
 #include <linux/slab.h>
 #include <linux/ratelimit.h>
 #include <linux/oom.h>
@@ -105,6 +109,13 @@
 #include "../../kernel/sched/sched.h"
 #include "../drivers/tty/serial/8250/8250.h"
 #include "../drivers/vhost/vhost.h"
+#include "../arch/x86/kvm/lapic.h"
+#include "../block/blk-mq.h"
+#include "../block/blk-mq-tag.h"
+
+#ifdef CONFIG_VMIO
+#include "../drivers/vmio/vmio.h"
+#endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
 #include <asm/text-patching.h>
@@ -113,6 +124,7 @@
 #include <asm/sections.h>
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
+#include <asm/hypervisor.h>
 
 #include "kdbxdefs.h"
 #include "kdbxproto.h"

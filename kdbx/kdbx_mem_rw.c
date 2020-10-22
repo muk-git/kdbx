@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009, Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009, 2019 Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -66,7 +66,7 @@ static ulong kdb_lookup_pt_entry(ulong gfn, int idx, struct kvm_vcpu *vp)
 {
     char *va;
     ulong rval;
-    ulong pfn = kdbx_p2m(vp, gfn);
+    ulong pfn = kdbx_p2m(vp, gfn, 1);
     struct page *pg = pfn_valid(pfn) ? pfn_to_page(pfn) : NULL;
 
     va = pg ? page_to_virt(pg):NULL;  /* don't kmap(), it calls _cond_resched */
@@ -150,7 +150,7 @@ static ulong kdb_pt_pfn(ulong addr, ulong cr3gfn, struct kvm_vcpu *vp,
 
 out:
     KDBGP1("kdb_pt_pfn: addr: %lx gfn:%lx level:%d\n", addr, gfn, *levelp);
-    return kdbx_p2m(vp, gfn);
+    return kdbx_p2m(vp, gfn, 1);
 }
 
 /* RETURNS: number of bytes copied */
@@ -276,6 +276,8 @@ int kdbx_write_mem(kdbva_t daddr, kdbbyt_t *sbuf, int len, struct kvm_vcpu *vp)
 
     if ( vp == NULL ) {          /* host memory */
         if ( __kernel_text_address(daddr) )
+            // return kdb_early_wmem(daddr, sbuf, len);
+            /* earlier in boot in setup_arch, following not work in 4.14.35 */
             return kdbx_write_protected(daddr, sbuf, len);
 
         rc = probe_kernel_write((void *)daddr, (void *)sbuf, len);

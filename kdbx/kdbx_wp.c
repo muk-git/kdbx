@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009, Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009, 2019 Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -217,10 +217,12 @@ static void kdb_clear_dr7_gx(int regno, kdbma_t *dr7p)
 void kdbx_install_watchpoints(void)
 {
     int regno;
-    kdbma_t dr7 = kdbx_rd_dbgreg(7);
+    kdbma_t dr7;
 
     if ( !kdb_wp_active )
         return;
+
+    dr7 = kdbx_rd_dbgreg(7);
 
     for (regno=0; regno < KDB_MAXWP; regno++) {
         /* do not clear wp_deleted here as all cpus must clear wps */

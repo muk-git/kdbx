@@ -1,4 +1,6 @@
 /*
+ * Copyright (C) 2009, 2019 Mukesh Rathor, Oracle Corp.  All rights reserved.
+ *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
  * License v2 as published by the Free Software Foundation.
@@ -33,7 +35,7 @@ typedef struct {
 static volatile unsigned int dtrcidx;    /* points to where new entry will go */
 static trc_rec_t dtrca[DKDBTRCMAX];      /* trace array */
 
-/* add trace entry: eg.: kdbtrc(0xe0f099, intdata, vcpu, domain, 0)
+/* add trace entry: eg.: kdbgtrc(0xe0f099, intdata, vcpu, domain, 0)
  *    where:  0xe0f099 : 24bits max trcid, upper 8 bits are set to cpuid */
 void kdbgtrc(uint trcid, uint int_d0, uint64_t d1_64, uint64_t d2_64, 
              uint64_t d3_64)
@@ -74,7 +76,7 @@ static int __init setup_kdbx_ignore_nmi(char *str)
 __setup("kdbx_ignore_nmi", setup_kdbx_ignore_nmi);
 
 /* add kdbx_no_smp_pause_nmi or kdbx_no_smp_pause_nmi=1 in grub to override */
-uint kdbx_no_smp_pause_nmi=0;
+uint kdbx_no_smp_pause_nmi=1;
 static int __init setup_kdbx_no_smp_pause_nmi(char *str)
 {
         kdbx_no_smp_pause_nmi = 1;
@@ -128,8 +130,20 @@ struct kvm_vcpu *kdbx_set_guest_mode(struct pt_regs *regs,
 
 void kdbx_cpu_relax(void)
 {
+    /* cpu_relax() will do pause which in VM will do pause vmexit */
     if ( !kdbx_in_kvm_guest )
         cpu_relax();
+}
+
+static void kdbx_touch_global_watchdogs(void)
+{
+        ulong flags;
+
+        local_irq_save(flags);
+        clocksource_touch_watchdog();       /* global */
+        rcu_cpu_stall_reset();              /* global */
+        reset_hung_task_detector();         /* global */
+        local_irq_restore(flags);
 }
 
 static void kdb_set_single_step(struct pt_regs *regs)
@@ -159,9 +173,10 @@ static void kdb_hold_this_cpu(struct pt_regs *regs)
 {
     int ccpu = smp_processor_id();      /* current cpu */
 
-    clear_tsk_need_resched(current);
-
     kdbgtrc(0x310, kdbx_cpu_cmd[ccpu], 0, 0, 0);
+    if ( kdbx_no_smp_pause_nmi )
+        local_irq_enable(); /* so we can receive a pause IPI */
+
     KDBGP1("[%d]in hold. cmd:%x\n", ccpu, kdbx_cpu_cmd[ccpu]);
     do {
         for(; kdbx_cpu_cmd[ccpu] == KDB_CPU_PAUSE; kdbx_cpu_relax());
@@ -187,6 +202,7 @@ static void kdb_hold_this_cpu(struct pt_regs *regs)
             kdbx_cpu_cmd[ccpu] = KDB_CPU_QUIT;
 
     } while (kdbx_cpu_cmd[ccpu] == KDB_CPU_PAUSE);     /* No goto, eh! */
+
     kdbgtrc(0x31f, kdbx_cpu_cmd[ccpu], 0, 0, 0);
     KDBGP("[%d]Unhold: cmd:%d\n", ccpu, kdbx_cpu_cmd[ccpu]);
 }
@@ -205,7 +221,8 @@ static void kdb_smp_pause_cpus(void)
     kdbgtrc(0x300, 0, cpumask.bits[0], cpumask.bits[1], cpumask.bits[2]);
 
     if ( kdbx_no_smp_pause_nmi ) {
-        ASSERT(irqs_enabled());     /* smp_call_function_many needs this */
+        // ASSERT(irqs_enabled());     /* smp_call_function_many needs this */
+        local_irq_enable();
         smp_call_function_many(&cpumask, kdbx_pause_this_cpu, NULL, 0);
     } else {
         kdb_pause_nmi_inprog = 1;
@@ -267,9 +284,9 @@ static void kdb_begin_session(void)
 {
     if ( !kdbx_session_begun ) {
         kdbx_session_begun = 1;
+        kdbx_uninstall_all_swbp();
         kdb_smp_pause_cpus();
         kdbx_watchdog_disable();
-        kdbx_uninstall_all_swbp();
         rcu_cpu_stall_suppress = 1;
         clear_tsk_need_resched(current);
     }
@@ -302,7 +319,7 @@ static void kdb_smp_unpause_cpus(int ccpu)
     };
     /* now make sure they are all in there */
     for_each_cpu(cpu, &cpumask)
-        if (kdbx_cpu_cmd[cpu] != KDB_CPU_INVAL)
+        if (kdbx_cpu_cmd[cpu] == KDB_CPU_PAUSE)
             kdbxp("[%d]KDB: cpu %d still paused (cmd==%d).\n",
                  ccpu, cpu, kdbx_cpu_cmd[cpu]);
 }
@@ -316,7 +333,10 @@ static void kdb_smp_unpause_cpus(int ccpu)
  */
 static void kdb_end_session(int ccpu, struct pt_regs *regs)
 {
-    ASSERT(kdbx_session_begun);
+    ulong flags;
+
+    /* incase bp is set in interrupt, disable for the entire block */
+    local_irq_save(flags);
     kdbx_install_all_swbp();
     kdbx_flush_swbp_table();
     kdbx_install_watchpoints();
@@ -324,11 +344,12 @@ static void kdb_end_session(int ccpu, struct pt_regs *regs)
     kdb_clr_single_step(regs);
     kdbx_cpu_cmd[ccpu] = KDB_CPU_INVAL;
     // kdb_time_resume(1);
-    kdbx_session_begun = 0;    /* before unpause for kdb_install_watchpoints */
-    rcu_cpu_stall_reset();
+    kdbx_session_begun = 0;    /* before unpause for kdbx_install_watchpoints */
+    kdbx_touch_global_watchdogs();
+    touch_softlockup_watchdog_sync();   /* per cpu */
     kdb_smp_unpause_cpus(ccpu);
-    /* kdb_watchdog_enable(); */
     KDBGP("[%d]kdb_end_session\n", ccpu);
+    local_irq_restore(flags);
 }
 
 /* 
@@ -413,11 +434,12 @@ static int kdbxmain(kdbx_reason_t reason, struct pt_regs *regs)
     // int delayed_install = (kdbx_cpu_cmd[ccpu] == KDB_CPU_INSTALL_BP);
     int enabled = irqs_enabled();
 
-    kdbgtrc(0x210, reason, cmd, kdb_init_cpu, regs->KDBIP);
+    kdbgtrc(0x210, reason, cmd, enabled, regs->KDBIP);
     KDBGP("[%d]kdbxmain: rsn:%d eflgs:0x%lx cmd:%d initc:%d irqs:%d "
           "regs:%lx IP:%lx cpid:%d\n", ccpu, reason, regs->flags, cmd, 
           kdb_init_cpu, enabled, regs, regs->KDBIP, current->pid);
 
+#if 0
     /* when coming thru any INT/NMI, like keyboard or pause IPI, ints will
      * be disabled by cpu. when coming from guest, ints are enabled.
      * NOTE: enabling here means, don't set bp in _raw_spin_unlock_irqrestore
@@ -425,6 +447,11 @@ static int kdbxmain(kdbx_reason_t reason, struct pt_regs *regs)
      *       recursion in kdb as soon as irq is enabled, and it may hang.
      *       May be in future, move irq enable to after bp has been uninstalled,
      *       in the while loop bellow. But then we need semaphore sleep/wake */
+#endif
+
+    /* need this enabled: if two BPs hit simultaneously, then one of them
+     * will be sitting here disabled in the while loop. INTs are disabled
+     * upon exception */
     local_irq_enable();  /* so we can receive IPI. smp pause needs this */
 
     if (!ss_mode && ccpu != kdb_init_cpu && reason != KDB_REASON_PAUSE_IPI) {
@@ -500,12 +527,20 @@ static int kdbxmain(kdbx_reason_t reason, struct pt_regs *regs)
         kdb_end_session(ccpu, regs);
         kdb_init_cpu = -1;
     }
+
+    if (kdbx_cpu_cmd[ccpu] == KDB_CPU_NI) {
+        kdbx_touch_global_watchdogs();
+        touch_softlockup_watchdog_sync();   /* per cpu */
+        clear_tsk_need_resched(current);
+    }
+
 out:
     if (kdbx_cpu_cmd[ccpu] == KDB_CPU_QUIT) {
         KDBGP1("ccpu:%d _quit IP: %lx\n", ccpu, regs->KDBIP);
         if (! kdbx_session_begun )
             kdbx_install_watchpoints();
         // kdb_time_resume(0);
+        touch_softlockup_watchdog_sync();   /* per cpu */
         kdbx_cpu_cmd[ccpu] = KDB_CPU_INVAL;
     }
 
@@ -620,7 +655,7 @@ int kdbx_handle_trap_entry(int vector, const struct pt_regs *regs1)
         } else if (kdb_trap_immed_reason == KDBX_TRAP_KDBSTACK) {
             kdb_trap_immed_reason = 0;    /* show kdb stack */
             kdbx_print_regs(regs);
-            kdbx_show_stack(regs, 0, 24);      /* always host */
+            kdbx_show_stack(regs, 0, 0, 24); /* always host */
             regs->flags &= ~X86_EFLAGS_TF;
             rc = 1;
 
@@ -715,6 +750,10 @@ void kdbxmain_fatal(struct pt_regs *regs, int vector)
     int ccpu = smp_processor_id();
 
     if ( vector == X86_TRAP_DF ) {
+        if (!spin_trylock(&kdb_nmi_lk)) {
+            kdbxp("kdbx: DF, looks like nmi in progress. just loop.\n");
+            while (1);
+        }
         /* got double fault: usually, the cpu is wedged so badly in case of df,
          * that not much can be executed on it. avoid ipi, etc.. */
         kdbxp("[%d]got double fault. attempting to kdbx_do_cmds()\n", ccpu);
@@ -722,6 +761,8 @@ void kdbxmain_fatal(struct pt_regs *regs, int vector)
             kdbx_do_cmds(regs);
     }
     if (spin_trylock(&kdb_nmi_lk)) {
+        KDBGP("[%d]kdbxfatal main. \n", ccpu);
+        rcu_cpu_stall_suppress = 1;     /* suppress rcu watchdog nmis */
         kdbx_sys_crash = 1;
         kdbx_session_begun = 0;         /* incase session already active */
         kdbx_cpu_cmd[ccpu] = KDB_CPU_MAIN_KDB;
@@ -737,6 +778,7 @@ void kdbxmain_fatal(struct pt_regs *regs, int vector)
         kdbx_session_begun = 1;  /* for kdb_hold_this_cpu() */
         local_irq_disable();
     } else {
+        KDBGP("[%d]kdbxfatal holdcpu. \n", ccpu);
         kdbx_cpu_cmd[ccpu] = KDB_CPU_PAUSE;
         // kdbxmain(KDB_REASON_PAUSE_IPI, regs);
     }
@@ -752,7 +794,7 @@ void kdbxmain_fatal(struct pt_regs *regs, int vector)
  * kdb_trap_immed_reason is global, so allow only one cpu at a time. Also,
  * multiple cpu may be crashing at the same time. We enable because if there
  * is a bad hang, at least ctrl-\ will break into kdb. Also, we don't call
- * call kdbx_keyboard directly becaue we don't have the register context.
+ * kdbx_keyboard directly becaue we don't have the register context.
  */
 DEFINE_SPINLOCK(kdb_immed_lk);
 void kdbx_trap_immed(int reason)        /* fatal, non-fatal, kdb stack etc... */
@@ -761,15 +803,18 @@ void kdbx_trap_immed(int reason)        /* fatal, non-fatal, kdb stack etc... */
     int disabled = irqs_disabled();
 
     KDBGP("[%d]trapimm: reas:%d\n", ccpu, reason);
-    if ( reason != KDBX_TRAP_KDBSTACK )
+    if ( reason == KDBX_TRAP_FATAL)
+        local_irq_disable();
+    else if ( reason != KDBX_TRAP_KDBSTACK )
         local_irq_enable();
+
     spin_lock(&kdb_immed_lk);
     kdb_trap_immed_reason = reason;
     barrier();
     __asm__ __volatile__ ( "int $1" );
     kdb_trap_immed_reason = 0;
-
     spin_unlock(&kdb_immed_lk);
+
     if (reason != KDBX_TRAP_KDBSTACK && disabled)
         local_irq_disable();
 }
@@ -864,6 +909,9 @@ void __init kdbx_init(char *boot_command_line)
     if (!kdbx_in_kvm_guest)
         kdbx_init_vmx_extint_info();
 
+    printk("kdbx: turned off rcu stall warnings.. rcu_cpu_stall_suppress\n");
+    rcu_cpu_stall_suppress = 1;
+
     if ( kdbx_in_kvm_guest ) 
         pr_info("kdbx: running in kvm guest\n");
     else
@@ -897,9 +945,9 @@ static const char *kdb_gettrapname(int trapno)
 /* ====================== Generic tracing subsystem ======================== */
 /* TIMESTAMP/DELAY : use sched_clock() for timestamps tracing */
 
-#define KDBTRCMAX 1       /* set this to max number of recs to trace. each rec 
+#define KDBTRCMAX 4096    /* set this to max number of recs to trace. each rec 
                            * is 32 bytes */
-volatile int kdbx_trcon=0; /* turn tracing ON: set here or via the trcon cmd */
+volatile int kdbx_trcon=1; /* turn tracing ON: set here or via the trcon cmd */
 
 static volatile unsigned int trcidx;    /* points to where new entry will go */
 static trc_rec_t trca[KDBTRCMAX];       /* trace array */
@@ -970,19 +1018,53 @@ void noinline mukchk(unsigned long ul)
 
 /* =========== */
 
-/* see sched_clock() */
+/* return current rsp */
+ulong kdbx_rsp(void)
+{
+        ulong regrsp;
+
+        asm("mov %%rsp, %0" : "=r" (regrsp));
+        return regrsp;
+}
+
+/* WARN: on VM, sched_clock() is pv call, so on VM it has overhead. 
+ *       OTOH, jiffies may not be updated in time for nano secs timestamps,
+ *       specially on VM, so tsc seems the best option.
+ *         t1=rdtsc();  sleep x;  delta=rdtsc() - t1;  ns=kdbx_tsc_to_ns(delta)
+ *
+ *      Another option is to use: ktime_get() and ktime_to_ns()
+ * NOTE: this was verified in kdbx usr1 using mdelay and udelay, works.
+ */
+ulong kdbx_tsc_to_ns(ulong delta)
+{
+        ulong ns;
+        struct cyc2ns_data data;
+
+        cyc2ns_read_begin(&data);
+        ns = mul_u64_u32_shr(delta, data.cyc2ns_mul, data.cyc2ns_shift);
+        cyc2ns_read_end();
+
+        return ns;
+}
+
+ulong kdbx_tsc_to_us(ulong delta)
+{
+        return kdbx_tsc_to_ns(delta) / NSEC_PER_USEC;
+}
+
+
 static inline ulong kdb_nsecs(void)
 {
-        unsigned long long nsec;
+        // unsigned long nsec;
 
-        nsec =  (unsigned long long)(jiffies - INITIAL_JIFFIES)
-                                        * (NSEC_PER_SEC / HZ);
-        return (nsec);
+        return ktime_to_ns(ktime_get());
+        // nsec = (ulong)(jiffies - INITIAL_JIFFIES) * (NSEC_PER_SEC / HZ);
+        // return nsec;
 }
 
 ulong kdbx_usecs(void)
 {
-    return kdb_nsecs() >> 10;
+    return kdb_nsecs() >> 10;     /* div by 1024 instead of 1000, but fast */
 }
 
 int mukadd(int i, uint *p)

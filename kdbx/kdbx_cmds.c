@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009, Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009, 2019 Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -102,6 +102,7 @@ static struct kdbxtab *tbp;
 static kdbbyt_t kdb_membuf[DDBUFSZ];    /* can't allocate on stack of this sz */
 
 static int kdb_set_bp(pid_t, kdbva_t, int, ulong *, char*, char*, char*);
+static int kdb_install_swbp(int idx);
 
 
 /* ===================== cmdline functions  ================================ */
@@ -147,14 +148,31 @@ struct kdbx_excp_resume_state {
 struct kdbx_excp_resume_state kdbx_excp_sav, *kdbx_excp_ptr = &kdbx_excp_sav;
 int kdbx_in_fixup;
 
-/* returns: 0 if fixup done. 1 implies exception in fixup path */
-int kdbx_excp_fixup(struct pt_regs *regs)
+/* returns: 0 if fixup done. 1 implies exception in non-kdbx or in fixup path */
+int kdbx_excp_fixup(struct pt_regs *regs, int vector)
 {
+    char *fname;
     struct kdbx_excp_resume_state *excp = &kdbx_excp_sav;
     int ccpu = smp_processor_id();
 
     if ( kdbx_in_fixup )
         return 1;     /* nested exception, ignore */
+
+    fname = kdbx_hostsym((void *)regs->ip);
+    if ( fname == NULL)
+        return 1;
+
+    if (strncmp(fname, "kdbx_", 5) != 0 && strncmp(fname, "kdb_", 4) != 0)
+        return 1;
+
+    if ( vector == X86_TRAP_GP) {
+        kdbxp("kdbx: got #GP ip:%lx sp:%lx\n", regs->ip, regs->sp);
+    } else if (vector == X86_TRAP_PF) {
+        ulong cr2 = read_cr2();
+        kdbxp("kdbx: got #PF ip:%lx cr2:%lx sp:%lx\n", regs->ip, cr2, regs->sp);
+    } else  {
+        kdbxp("kdbx fixup fixme. got vec:%d. regs:%p\n", vector, regs);
+    }
 
     kdbx_in_fixup = 1;
     regs->ip = excp->resume_rip;
@@ -177,10 +195,10 @@ void kdbx_do_cmds(struct pt_regs *regs)
 {
     char *cmdlinep;
     const char *argv[KDB_MAXARGC];
-    int argc = 0, curcpu = smp_processor_id();
+    int argc = 0, ccpu = smp_processor_id();
     kdbx_cpu_cmd_t result = KDB_CPU_MAIN_KDB;
 
-    snprintf(kdb_prompt, sizeof(kdb_prompt), "[%d]kdbx> ", curcpu);
+    snprintf(kdb_prompt, sizeof(kdb_prompt), "[%d]kdbx> ", ccpu);
 
     while (result == KDB_CPU_MAIN_KDB) {
         cmdlinep = kdbx_get_input(kdb_prompt);
@@ -212,7 +230,7 @@ void kdbx_do_cmds(struct pt_regs *regs)
         } else
             kdbxp("kdb: Unknown cmd: %s\n", cmdlinep);
     }
-    kdbx_cpu_cmd[curcpu] = result;
+    kdbx_cpu_cmd[ccpu] = result;
 }
 
 /* ===================== Util functions  ==================================== */
@@ -272,6 +290,10 @@ static int kdbx_sym_callback(void *data, const char *name,
     int dotlen = kdbx_sym_find_dot((char *)name);
 
     if (dotlen == 0 || strncmp(symname, name, dotlen) != 0) 
+        return 0;
+
+    /* don't match vmiodbg with vm.23479 */
+    if (dotlen != strlen(data))
         return 0;
 
     /* we were looking for console_trylock.part.17, but found console_trylock */
@@ -339,7 +361,7 @@ char *kdbx_hostsym(void *addr)
 }
 
 /*
- * convert ascii to int decimal (base 10). 
+ * convert ascii to int decimal (base 10). Handles leading 0x.
  * Return: 0 : failed to convert, otherwise 1 
  */
 static int kdb_str2decil(const char *strp, ulong *ulp)
@@ -659,6 +681,21 @@ static int kdb_gfn_valid(struct kvm_vcpu *vp, ulong gfn, int prerr)
         kdbxp("Invalid gfn:%lx\n", gfn);
 
     return 0;
+}
+
+static int kdb_pfn_valid(ulong pfn, int prerr)
+{
+    if ( pfn > max_pfn ) {
+        if (prerr)
+            kdbxp("pfn:%lx is greater than max_pfn:%lx\n", pfn, max_pfn);
+        return 0;
+    }
+    if ( ! page_is_ram(pfn)) {
+        if (prerr)
+            kdbxp("pfn:%lx is not a ram page\n", pfn);
+        return 0;
+    }
+    return 1;
 }
 
 /* return a guest bitness: 32 or 64 */
@@ -1033,6 +1070,7 @@ kdb_cmdf_dism(int argc, const char **argv, struct pt_regs *regs)
 }
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,35)
+
 void kdbx_show_stack(struct pt_regs *regs, pid_t pid, int prmax)
 {
     ulong spval, *sp_ptr;
@@ -1316,13 +1354,16 @@ struct pt_regs *kdbx_dump_type_stack(kdbva_t ip, struct pt_regs *regs,
             kdbx_print_instr(spval, 1, 0);
     }
     }
-    if ( regs == NULL || regs->bp ==  0 )
-        return NULL;    /* ef it :) */
-    kdbx_walk_bp_stack(regs->bp, tp);
+    if ( regs == NULL || regs->bp ==  0 ) {
+        kdbxp("Walking the stack using SP\n");
+        kdbx_walk_sp_stack(spaddr, 0, NULL, 0, tp, max);
+    } else
+        kdbx_walk_bp_stack(regs->bp, tp);
+
     // kdbxp("--- Now showing sp stack for debug ---- \n");
     // kdbx_walk_sp_stack(spaddr, 0, NULL, 0, tp, 20);
 #else
-    kdbx_walk_sp_stack(spaddr, 0, vp, gpid, tp, prmax);
+    kdbx_walk_sp_stack(spaddr, 0, vp, gpid, tp, max);
 #endif
 
     /* task_pt_regs is not interesting to us because that is where the context
@@ -1353,8 +1394,10 @@ struct pt_regs *kdbx_dump_type_stack(kdbva_t ip, struct pt_regs *regs,
  * switch to kernel thread stack top/beginning and save context, then switch 
  * to thread kernel stack before calling do_IRQ.
  * In kdbx, we are mostly intrested in the top/current frame. 
+ *
+ * kstack: allow to display kernel thread stack for a vcpu thread.
  */
-void kdbx_show_stack(struct pt_regs *regs, pid_t pid, int prmax)
+void kdbx_show_stack(struct pt_regs *regs, pid_t pid, int kstack, int prmax)
 {
     ulong *spaddr;
     struct task_struct *tp = NULL;
@@ -1362,7 +1405,7 @@ void kdbx_show_stack(struct pt_regs *regs, pid_t pid, int prmax)
     struct kvm_vcpu *vp = NULL;
     pid_t gpid = 0;
 
-    if ( (vp = kdbx_pid_to_vcpu(pid, 0)) )
+    if ( !kstack && (vp = kdbx_pid_to_vcpu(pid, 0)) )
         gpid = pid;
 
     if ( vp ) {
@@ -1374,6 +1417,8 @@ void kdbx_show_stack(struct pt_regs *regs, pid_t pid, int prmax)
         spaddr = (ulong *)regs->sp;
         tp = current;
     } else {
+        /* regs not relevant when dumping stack of different thread */
+        regs = NULL;
         tp = kdb_pid2tp(pid, 0);
         ip = 0;
         spaddr = (ulong *)tp->thread.sp;
@@ -1382,8 +1427,10 @@ void kdbx_show_stack(struct pt_regs *regs, pid_t pid, int prmax)
           kdbx_guest_mode(regs), vp, ip, spaddr);
 
     if ( gpid ) {
-        if ( !kdbx_guest_sym_loaded(gpid) )
+        if ( !kdbx_guest_sym_loaded(gpid) ) {
+            kdbxp("Guest syms are not loaded\n");
             return;
+        }
         else {
             kdbxp("Note: Guest stack does not use frame pointer\n");
             if ( ip )
@@ -1396,14 +1443,12 @@ void kdbx_show_stack(struct pt_regs *regs, pid_t pid, int prmax)
     /* now don't go more than two types, kdbx really doesn't care beyond */
     regs = kdbx_dump_type_stack(ip, regs, spaddr, tp, prmax);
     if ( regs )
-        kdbx_dump_type_stack(ip, regs, spaddr, tp, prmax);
+        kdbx_dump_type_stack(regs->ip, regs, (ulong *)regs->sp, tp, prmax);
 }
 
 #endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4,14,35) */
 
 
-/* display stack. if vcpu ptr given, then display stack for that. Otherwise,
- * use current regs */
 static kdbx_cpu_cmd_t kdb_usgf_f(void)
 {
     kdbxp("f [pid] [m #]: dump current stack. m # for max frames\n");
@@ -1435,7 +1480,67 @@ kdb_cmdf_f(int argc, const char **argv, struct pt_regs *regs)
                 return KDB_CPU_MAIN_KDB;
         }
     }
-    kdbx_show_stack(regs, pid, max);
+    kdbx_show_stack(regs, pid, 0, max);
+    return KDB_CPU_MAIN_KDB;
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_fk(void)
+{
+    kdbxp("fk [pid] [m #]: dump kernel stack for a guest thread\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t 
+kdb_cmdf_fk(int argc, const char **argv, struct pt_regs *regs)
+{
+    int max = 24;
+
+    pid_t pid = kdbx_guest_mode(regs) ? current->pid : 0;
+
+    if ( argc > 4 )
+        return kdb_usgf_fk();
+
+    if (argc > 1 ) {
+        if ( *argv[1] == '0' ) {
+            pid = 0;      /* always allow host pid override */
+        } else if ( !kdb_str2pid(argv[1], &pid, 1) ) {
+            if ( (*argv[1] !=  'm') || argc != 3 || 
+                 !kdb_str2deci(argv[2], &max))
+            {
+                return KDB_CPU_MAIN_KDB;
+            }
+        } else if (argc == 2 ) {
+            ;      /* 2 args are ok with valid pid */
+        } else if (argc < 4 || (*argv[2] != 'm') || 
+                   !kdb_str2deci(argv[3], &max))
+        {
+                return KDB_CPU_MAIN_KDB;
+        }
+    }
+    kdbx_show_stack(regs, pid, 1, max);
+
+    return KDB_CPU_MAIN_KDB;
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_fsp(void)
+{
+    kdbxp("fsp [m #]: dump sp stack (ignore bp). m # for max frames\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t 
+kdb_cmdf_fsp(int argc, const char **argv, struct pt_regs *regs)
+{
+    int max = 24;
+
+    if ( argc > 3 || argc == 2 )
+        return kdb_usgf_fsp();
+
+    if (argc > 1 ) {
+        if ((*argv[1] != 'm') || !kdb_str2deci(argv[2], &max))
+            return kdb_usgf_fsp();
+    }
+    kdbx_print_instr(regs->ip, 1, 0);
+    kdbx_walk_sp_stack((ulong *)regs->sp, 0, NULL, 0, NULL, max);
+
     return KDB_CPU_MAIN_KDB;
 }
 
@@ -1992,7 +2097,7 @@ kdb_cmdf_ni(int argc, const char **argv, struct pt_regs *regs)
 
     /* 10/22/18: too many kernel threads that a cpu will offload to during ni,
      * so try using GO */
-#ifdef KDBX_CONFIG_NI_AS_NOT_GO
+#ifndef KDBX_CONFIG_NI_AS_GO
     kdb_install_swbp(i);
     return KDB_CPU_NI;
 #endif
@@ -2598,7 +2703,7 @@ int kdbx_check_sw_bkpts(struct pt_regs *regs)
     if ( rc == 3 && kdb_sbpa[i].bp_addr ) /* make sure was not an ni */
         kdbxp("Breakpoint on cpu %d at 0x%lx\n", ccpu, regs->KDBIP);
 
-    KDBGP("[%d] rc:%d cpid:%d addr:%lx\n", 
+    KDBGP("[%d]check_sw_bkpts: rc:%d cpid:%d addr:%lx\n", 
            smp_processor_id(), rc, current->pid, kdb_sbpa[i].bp_addr);
     return (rc);
 }
@@ -2947,6 +3052,28 @@ kdb_cmdf_wc(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
+static kdbx_cpu_cmd_t kdb_usgf_us2jiffs(void)
+{
+    kdbxp("us2jiffs usecs: convert usecs to jiffies\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_us2jiffs(int argc, const char **argv, struct pt_regs *regs)
+{
+    ulong usecs, jiffs;
+
+    if (argc != 2) 
+        return kdb_usgf_us2jiffs();
+    
+    if (!kdb_str2decil(argv[1], &usecs)) {
+        kdbxp("Invalid usecs: %s\n", argv[1]);
+        return kdb_usgf_us2jiffs();
+    }
+    jiffs = usecs_to_jiffies(usecs);
+    kdbxp("%lx/$%ld usecs == %lx/$%ld jiffies\n", usecs, usecs, jiffs, jiffs);
+    return KDB_CPU_MAIN_KDB;
+}
+
 /* Dump timer/timers queues */
 static kdbx_cpu_cmd_t kdb_usgf_trq(void)
 {
@@ -2959,7 +3086,7 @@ kdb_cmdf_trq(int argc, const char **argv, struct pt_regs *regs)
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(4,1,12)
     kdbxp("Not implemented\n");
 #else
-    kdbx_dump_timer_queues();
+    kdbx_dump_timer_queues();   /* kernel/timer/timer.c */
 #endif
     return KDB_CPU_MAIN_KDB;
 }
@@ -3390,40 +3517,110 @@ kdb_cmdf_dgdt(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
+static char *kdbx_sched_class_str(const struct sched_class *sp)
+{
+    /* see extern decalarations in kernel/sched/sched.h for all classes */
+
+    if ( sp == &stop_sched_class )
+        return "stop_sched_class";
+    else if ( sp == &dl_sched_class )
+        return "dl_sched (deadline sched)";
+    else if ( sp == &rt_sched_class )
+        return "rt_sched (realtime sched)";
+    else if ( sp == &fair_sched_class )
+        return "fair_sched_class";
+    else if ( sp == &idle_sched_class )
+        return "idle_sched_class";
+    else 
+        return "unknown sched class";
+}
+
+static void kdbx_print_thread_struct(struct task_struct *tp)
+{
+    struct thread_struct *th = &tp->thread;
+
+    kdbxp("  struct thread: (%p)\n", th);
+    kdbxp("    sp:%lx  gsbase:%lx  cr2:%lx\n", th->sp, th->gsbase, th->cr2);
+    kdbxp("    iopl: %lx  io_bitmap_ptr:%p\n", th->iopl, th->io_bitmap_ptr);
+}
+
+static void kdbx_disp_mm_struct(struct mm_struct *mm)
+{
+    if ( mm == NULL)
+        return;
+
+    kdbxp("  struct mm: %p \n", mm);
+    kdbxp("      pgd: %p nr_ptes: $%d task_size: %lx\n",
+          mm->pgd, mm->nr_ptes, mm->task_size);
+    kdbxp("      mmap_base: %lx highest_vm_end: %lx\n",
+          mm->mmap_base, mm->highest_vm_end);
+    kdbxp("      mm_users: $%d mm_count: $%d map_count: $%d\n", 
+          mm->mm_users, mm->mm_count, mm->map_count);
+    kdbxp("      tot-mapped-pgs: %x($%d)\n", mm->total_vm, mm->total_vm);
+    kdbxp("\n");
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_mm(void)
+{
+    kdbxp("mm ptr: display struct mm_struct at given ptr\n");
+    return KDB_CPU_MAIN_KDB;
+}
+
+static kdbx_cpu_cmd_t
+kdb_cmdf_mm(int argc, const char **argv, struct pt_regs *regs)
+{
+    struct mm_struct *mm;
+
+    if (argc > 1) {
+        if (!kdb_str2ulong(argv[1], (ulong *)&mm)) 
+                return kdb_usgf_mm();
+    } else
+        return kdb_usgf_mm();
+
+    kdbx_disp_mm_struct(mm);
+    return KDB_CPU_MAIN_KDB;
+}
+
 /* struct task_struct include/linux/sched.h */
 static void kdb_display_task_struct(struct task_struct *tp)
 {
-    struct mm_struct *mm = tp ? tp->mm : NULL;
-    struct thread_struct *ths = &tp->thread;
-
     if ( tp == NULL )
         return;
 
     kdbxp("task_struct: %p  pid:%d  tgid:%d  comm:%s\n", tp, tp->pid, tp->tgid,
           tp->comm);
-    kdbxp("  state:%d (-1 unrunnable,  0 runnable,  >0 stopped)\n", tp->state);
-    kdbxp("  stack(bottom): %p (top: %p)  flags: %x\n", tp->stack, 
-          (char *)tp->stack+THREAD_SIZE, tp->flags);
-    kdbxp("  on_cpu:%d  on_rq:%d  blocked:%d  blk_plug:%p  policy:%x \n",
-          tp->on_cpu, tp->on_rq, tp->blocked, tp->plug, tp->policy);
+    kdbxp("  state:%d (0=TASK_RUNNING, >0 stopped)  flags:%x (2 == PF_IDLE)\n",
+          tp->state, tp->flags);
+    kdbxp("  stack: %p  stack+THREAD_SIZE: %p\n",
+          tp->stack, (char *)tp->stack+THREAD_SIZE);
+    kdbxp("  task_top_of_stack(task):%lx  task_pt_regs(task):%lx\n",
+          task_top_of_stack(tp), task_pt_regs(tp));
+    kdbxp("  task_cpu(p->cpu):0x%x on_cpu(boolean):%d  nr_cpus_allowed:%d  " 
+          "wake_cpu:%d\n",
+          task_cpu(tp), tp->on_cpu, tp->nr_cpus_allowed, tp->wake_cpu);
+    kdbxp("  on_rq:%d  prio:%d blocked:%d  (blk layer)plug:%lx  policy:%x \n",
+          tp->on_rq, tp->prio, tp->blocked, tp->plug, tp->policy);
+    kdbxp("  sched_class:%s  select_task_rq: %s\n",
+          kdbx_sched_class_str(tp->sched_class), 
+          kdbx_hostsym(tp->sched_class->select_task_rq));
 
-    kdbx_print_regs(task_pt_regs(tp));
+    kdbxp("\n");
+    kdbx_print_thread_struct(tp);
 
-    kdbxp("  struct mm: %p\n", tp->mm);
-    if ( mm ) {
-        kdbxp("      pgd: %p nr_ptes: $%d task_size: %lx\n",
-              mm->pgd, mm->nr_ptes, mm->task_size);
-        kdbxp("      mmap_base: %lx highest_vm_end: %lx\n",
-              mm->mmap_base, mm->highest_vm_end);
-        kdbxp("      mm_users: $%d mm_count: $%d map_count: $%d\n", 
-              mm->mm_users, mm->mm_count, mm->map_count);
-        kdbxp("      tot-mapped-pgs: %x($%d)\n", mm->total_vm, mm->total_vm);
-        kdbxp("\n");
+    /* task_pt_regs are at the stack top, useful when going from user to kernel,
+     * so has user context */
+    // kdbx_print_regs(task_pt_regs(tp));
+
+    kdbxp("  active_mm:%p\n", tp->active_mm);
+    kdbx_disp_mm_struct(tp->mm);
+
+    /* see to_kthread in kernel/kthread.c */
+    if ( tp->flags & PF_KTHREAD && tp->set_child_tid) {
+        ulong *p = (ulong *)tp->set_child_tid;
+
+        kdbxp("  struct kthread at:%p (flags:%lx  bit-0=KTHREAD_IS_PER_CPU)\n",
+              p, *p);
     }
-    kdbxp("  thread_struct: %p sp: %016lx  cr2: %016lx\n", ths, 
-          ths->sp, ths->cr2);
-    kdbxp("    io_bitmap_ptr: %p iopl: %x max: $%d\n", ths->io_bitmap_ptr,
-          ths->iopl, ths->io_bitmap_max);
 }
 
 static kdbx_cpu_cmd_t kdb_usgf_ts(void)
@@ -3454,6 +3651,7 @@ kdb_cmdf_ts(int argc, const char **argv, struct pt_regs *regs)
 static void kdb_show_threads(int show_ker, int show_usr)
 {
     struct task_struct *p, *t;
+    int tot=0;
 
     kdbxp("[UK]tsp        pid   tgid  nr_threads  state  comm\n");
     kdbxp("    (state:  -1 unrunnable,  0 runnable,  >0 stopped)\n");
@@ -3464,11 +3662,13 @@ static void kdb_show_threads(int show_ker, int show_usr)
         if ( (show_ker && kth) || (show_usr && !kth) ) {
 
             for_each_thread(p, t) {       /* includes parent process/thread */
-                kdbxp("[%c]%p %5d %5d %4d %d %s\n", kth ? 'K' : 'U', t,
+                tot++;
+                kdbxp("[%c]%p %5d %5d %4d %4d %s\n", kth ? 'K' : 'U', t,
                       t->pid, t->tgid, get_nr_threads(t), t->state, t->comm);
             }
         }
     }
+    kdbxp("Total: %d threads\n", tot);
 }
 
 /* Display scheduler basic and extended info */
@@ -3481,7 +3681,7 @@ static kdbx_cpu_cmd_t kdb_usgf_tl(void)
 static kdbx_cpu_cmd_t
 kdb_cmdf_tl(int argc, const char **argv, struct pt_regs *regs)
 {
-    int kernel = 0, user = 0;
+    int kernel=0, user=0;
 
     if (argc > 1) {
         if ( argv[1][0] == 'k' )
@@ -3497,22 +3697,6 @@ kdb_cmdf_tl(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
-static char *kdb_print_sched_class(const struct sched_class *sp)
-{
-    if ( sp == &stop_sched_class )
-        return "stop_sched_class";
-    else if ( sp == &dl_sched_class )
-        return "dl_sched (deadline sched)";
-    else if ( sp == &rt_sched_class )
-        return "rt_sched (realtime sched)";
-    else if ( sp == &fair_sched_class )
-        return "fair_sched_class";
-    else if ( sp == &idle_sched_class )
-        return "idle_sched_class";
-    else 
-        return "unknown sched class";
-}
-
 static noinline void kdb_display_runq(int cpu)
 {
     struct task_struct *g, *p;
@@ -3520,19 +3704,18 @@ static noinline void kdb_display_runq(int cpu)
 
     kdbxp("runq for cpu:%d nr_running:$%d nr_switches:$%d\n",
           cpu, rq->nr_running, rq->nr_switches);
-    kdbxp("    current:%p [%s]  idle:%p [%s] stop:%p [%s]\n", 
-          rq->curr, rq->curr->comm, rq->idle, rq->idle->comm,
-          rq->stop, rq->stop->comm);
+    kdbxp("    current:%p [%s]\n", rq->curr, rq->curr->comm);
+    kdbxp("    idle:%p [%s]\n",  rq->idle, rq->idle->comm);
+    kdbxp("    stop:%p [%s]\n", rq->stop, rq->stop->comm);
 
     kdbxp("    runq (next task could be any depending on policy): \n");
-
     for_each_process_thread(g, p) {  /* see print_rq() in kernel/sched/debug.c*/
         /* state: -1 unrunnable, 0 runnable, >0 stopped: */
         if (task_cpu(p) != cpu || p->state != TASK_RUNNING)
             continue;
         
         kdbxp("        pid: %d (%s) sched_class: %s\n",
-              task_pid_nr(p), p->comm, kdb_print_sched_class(p->sched_class));
+              task_pid_nr(p), p->comm, kdbx_sched_class_str(p->sched_class));
     }
     kdbxp("\n");
     return;
@@ -3578,11 +3761,24 @@ static kdbx_cpu_cmd_t kdb_usgf_sched(void)
     kdbxp("sched: show schedular info\n");
     return KDB_CPU_MAIN_KDB;
 }
-
 static kdbx_cpu_cmd_t
 kdb_cmdf_sched(int argc, const char **argv, struct pt_regs *regs)
 {
-    kdbxp("MUKESH: FIXME %s\n", __func__);
+    const struct sched_class *class;
+
+    kdbxp("schedular policies:\n");
+    kdbxp("  SCHED_NORMAL:   %d\n", SCHED_NORMAL);
+    kdbxp("  SCHED_FIFO:     %d\n", SCHED_FIFO);
+    kdbxp("  SCHED_RR:       %d\n", SCHED_RR);
+    kdbxp("  SCHED_BATCH:    %d\n", SCHED_BATCH);
+    kdbxp("  SCHED_IDLE:     %d\n", SCHED_IDLE);
+    kdbxp("  SCHED_DEADLINE: %d\n", SCHED_DEADLINE);
+
+    kdbxp("\nschedular classes:\n");
+    for_each_class(class) {
+        kdbxp("  %s:  select_task_rq:%s\n", kdbx_sched_class_str(class), 
+              kdbx_hostsym(class->select_task_rq));
+    }
     return KDB_CPU_MAIN_KDB;
 }
 
@@ -3606,6 +3802,7 @@ kdb_cmdf_mmu(int argc, const char **argv, struct pt_regs *regs)
     kdbxp("init_mm.pgd: %p\n", init_mm.pgd);
     kdbxp("PAGE_SIZE  : %x($%d)\n", PAGE_SIZE, PAGE_SIZE);
     kdbxp("PAGE_SHIFT : $%d\n", PAGE_SHIFT);
+    kdbxp("__START_KERNEL_map: %016lx\n", __START_KERNEL_map);
     kdbxp("PAGE_OFFSET: %016lx\n", PAGE_OFFSET);
     kdbxp("PAGE_MASK  : %016lx\n", PAGE_MASK);
     kdbxp("PTE_PFN_MASK      : %016lx\n", PTE_PFN_MASK);
@@ -3618,11 +3815,14 @@ kdb_cmdf_mmu(int argc, const char **argv, struct pt_regs *regs)
     kdbxp("PGDIR_SHIFT  : $%d\n", PGDIR_SHIFT);
     kdbxp("PHYSICAL_PUD_PAGE_MASK: %016lx\n", PHYSICAL_PUD_PAGE_MASK);
     kdbxp("PUD_MASK     : %016lx\n", PUD_MASK);
+    kdbxp("\n");
     kdbxp("HPAGE_SHIFT       : %016lx\n", HPAGE_SHIFT);
     kdbxp("HPAGE_SIZE        : %016lx\n", HPAGE_SIZE);
     kdbxp("HPAGE_MASK        : %016lx\n", HPAGE_MASK);
     kdbxp("HUGETLB_PAGE_ORDER: %016lx\n", HUGETLB_PAGE_ORDER);
     kdbxp("KVM_PFN_ERR_FAULT : %016lx\n", KVM_PFN_ERR_FAULT);
+    kdbxp("KVM_PFN_ERR_NOSLOT_MASK : %016lx\n", KVM_PFN_ERR_NOSLOT_MASK);
+    kdbxp("KVM_PFN_NOSLOT : %016lx\n", KVM_PFN_NOSLOT);
     kdbxp("\n");
     kdbxp("__KERNEL_CS    : %x\n", __KERNEL_CS);
     kdbxp("__KERNEL_DS/SS : %x\n", __KERNEL_DS);
@@ -3654,6 +3854,57 @@ kdb_cmdf_iommu(int argc, const char **argv, struct pt_regs *regs)
     kdbxp("FIXME\n");
     return KDB_CPU_MAIN_KDB;
 }
+
+static kdbx_cpu_cmd_t kdb_usgf_pa(void)
+{
+    kdbxp("pa addr: pa for the given addr\n");
+    return KDB_CPU_MAIN_KDB;
+}
+
+static kdbx_cpu_cmd_t
+kdb_cmdf_pa(int argc, const char **argv, struct pt_regs *regs)
+{
+    ulong va;
+
+    if ( argc < 2)
+        return kdb_usgf_pa();
+
+    if (!kdb_str2addr(argv[1], (kdbva_t *)&va, 0)) {
+        kdbxp("Invalid addr: %lx\n", va);
+        return KDB_CPU_MAIN_KDB;
+    }
+    kdbxp("pa thru virt_to_phys: %lx\n", virt_to_phys((void *)va));
+    kdbxp("pa thru __pa: %lx\n", __pa(va));
+
+    return KDB_CPU_MAIN_KDB;
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_va(void)
+{
+    kdbxp("va pfn: virtaddr for the given pfn\n");
+    return KDB_CPU_MAIN_KDB;
+}
+
+static kdbx_cpu_cmd_t
+kdb_cmdf_va(int argc, const char **argv, struct pt_regs *regs)
+{
+    ulong pfn;
+
+    if ( argc < 2)
+        return kdb_usgf_va();
+
+    if (!kdb_str2addr(argv[1], (kdbva_t *)&pfn, 0) ||
+        !kdb_pfn_valid(pfn, 1)) 
+    {
+        kdbxp("Invalid pfn: %lx\n", pfn);
+        return KDB_CPU_MAIN_KDB;
+    }
+    kdbxp("va thru phys_to_virt: %lx\n", phys_to_virt(pfn));
+    kdbxp("va thru __va: %lx\n", __va(pfn));
+
+    return KDB_CPU_MAIN_KDB;
+}
+
 
 #if 0
 static void 
@@ -3778,40 +4029,19 @@ static void kdb_display_page_flags(ulong flags)
     if (test_bit(PG_hwpoison, &flags))
         kdbxp("  PG_hwpoison");
 #endif
+#if defined(CONFIG_IDLE_PAGE_TRACKING) && defined(CONFIG_64BIT)
+    if (test_bit(PG_young, &flags))
+        kdbxp("  PG_young");
+    if (test_bit(PG_idle, &flags))
+        kdbxp("  PG_idle");
+        PG_idle,
+#endif
     kdbxp("\n");
 }
 
-/* print struct page_info{} given ptr to it or an mfn */
-static kdbx_cpu_cmd_t kdb_usgf_dpage(void)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
+static void kdbx_display_struct_page(struct page *pg)
 {
-    kdbxp("dpage pfn|page-ptr : Display struct page\n");
-    return KDB_CPU_MAIN_KDB;
-}
-static kdbx_cpu_cmd_t
-kdb_cmdf_dpage(int argc, const char **argv, struct pt_regs *regs)
-{
-    unsigned long val;
-    struct page *pgp;  /* include/linux/mm_types.h */
-
-    if (argc < 2) 
-        return kdb_usgf_dpage();
-
-    if (kdb_str2ulong(argv[1], &val) == 0) {
-        kdbxp("Invalid arg:%s\n", argv[1]);
-        return KDB_CPU_MAIN_KDB;
-    }
-    if ( page_is_ram(val) )     /* val is pfn? */
-        pgp = pfn_to_page(val);
-    else
-        pgp = (struct page *)val;
-    
-    if (pgp < vmemmap || pgp >= vmemmap + max_pfn) {
-        kdbxp("Invalid page ptr:%p\n", pgp);
-        return KDB_CPU_MAIN_KDB;
-    }
-
-    kdbxp("Page Info: %p   (include/linux/mm_types.h)\n", pgp);
-    kdb_display_page_flags(pgp->flags);
     kdbxp("  mapping: %p\n", pgp->mapping);
     kdbxp("  next word: %p", pgp->freelist);
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && USE_SPLIT_PMD_PTLOCKS
@@ -3841,6 +4071,75 @@ kdb_cmdf_dpage(int argc, const char **argv, struct pt_regs *regs)
 #ifdef CONFIG_WANT_PAGE_DEBUG_FLAGS
     kdbxp("  debug_flags: %016lx\n", pgp->debug_flags);
 #endif /* WANT_PAGE_VIRTUAL */  
+}
+
+#else /* LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0) */
+
+static void kdbx_display_struct_page(struct page *pgp)
+{
+    struct page *hdpg = compound_head(pgp);
+
+    if (pgp != hdpg) {
+        kdbxp("Page is part of huge/compound page. Displaying that first\n");
+        kdbx_display_struct_page(hdpg);
+        kdbxp("\n");
+    }
+
+    kdbxp("Page:%p  pfn:%lx (page MACROS in linux/mm_types.h)\n", pgp,
+          page_to_pfn(pgp));
+    kdb_display_page_flags(pgp->flags);
+
+    kdbxp("  compound_head:%lx  PageHuge(head):%d  PageHuge(page):%d\n",
+          (ulong)hdpg, PageHuge(hdpg), PageHuge(pgp));
+    kdbxp("  first union (mapping): %lx\n", pgp->mapping);
+    kdbxp("  second union (freelist): %lx\n", pgp->freelist);
+
+    kdbxp("  third union:\n");
+#if defined(CONFIG_HAVE_CMPXCHG_DOUBLE) && \
+        defined(CONFIG_HAVE_ALIGNED_STRUCT_PAGE)
+    kdbxp("      counters: %016lx OR \n", pgp->counters);
+#else
+    kdbxp("      counters: %08lx OR \n", pgp->counters);
+#endif
+    kdbxp("      _refcount: %08lx AND \n", pgp->_refcount);
+    kdbxp("      _mapcount OR active OR units: %x OR\n", pgp->active);
+    kdbxp("      inuse/obj/fr: %x/%x/%x\n", 
+          pgp->inuse, pgp->objects, pgp->frozen);
+}
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0) */
+
+/* print struct page_info{} given ptr to it or an mfn */
+static kdbx_cpu_cmd_t kdb_usgf_dpage(void)
+{
+    kdbxp("dpage pfn|page-ptr : Display struct page\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_dpage(int argc, const char **argv, struct pt_regs *regs)
+{
+    unsigned long val;
+    struct page *pgp;  /* include/linux/mm_types.h */
+
+    if (argc < 2) 
+        return kdb_usgf_dpage();
+
+    if (kdb_str2ulong(argv[1], &val) == 0) {
+        kdbxp("Invalid arg:%s\n", argv[1]);
+        return KDB_CPU_MAIN_KDB;
+    }
+    if ( page_is_ram(val) ) {     /* val is pfn? */
+        kdbxp("pfn %lx is a valid ram pfn\n", val);
+        pgp = pfn_to_page(val);
+    } else {
+        kdbxp("Trying %lx as page ptr\n", val);
+        pgp = (struct page *)val;
+    }
+    
+    if (pgp < vmemmap || pgp >= vmemmap + max_pfn) {
+        kdbxp("%lx neither ram pfn nor page ptr\n", val);
+        return KDB_CPU_MAIN_KDB;
+    }
+    kdbx_display_struct_page(pgp);
 
     return KDB_CPU_MAIN_KDB;
 }
@@ -4048,7 +4347,7 @@ kdb_cmdf_mods(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
-static ulong kdbx_ept_walk_table(struct kvm_vcpu *vp, ulong gfn, int pr_info)
+ulong kdbx_ept_walk_table(struct kvm_vcpu *vp, ulong gfn, int pr_info)
 {
     int i;
     struct page *pg;
@@ -4063,7 +4362,7 @@ static ulong kdbx_ept_walk_table(struct kvm_vcpu *vp, ulong gfn, int pr_info)
         kdbxp("EPT ptr mfn is invalid: %lx\n", eptmfn);
         return 0;
     }
-    if ( !kdb_gfn_valid(vp, gfn, 1) ) {
+    if ( !kdb_gfn_valid(vp, gfn, pr_info) ) {
         KDBGP("wept: gfn:%lx is invalid\n", gfn);
         return 0;
     }
@@ -4089,14 +4388,6 @@ static ulong kdbx_ept_walk_table(struct kvm_vcpu *vp, ulong gfn, int pr_info)
         if ( (i == 0) || !is_epte_present(eptep) )
             break;
         else if ( is_epte_superpage(eptep) ) {
-            if ( i == 3 ) {
-                kdbxp("superpage at level 3.. confused\n");
-                kdbxp("  entry:%lx gfn:%lx vp:%p\n", eptep->epte, gfn, vp);
-            } else if ( i == 2 )
-                kdbxp("1G superpage. Use bits 0-29 of guest Phys Addr\n");
-            else
-                kdbxp("2M superpage. Use bits 0-20 of guest Phys Addr\n");
-
             break;
 
         } else {
@@ -4112,10 +4403,36 @@ static ulong kdbx_ept_walk_table(struct kvm_vcpu *vp, ulong gfn, int pr_info)
             }
         }
     }
-    if ( i ) {
-        kdbxp("FIXME: ept using large page. i:%d\n", i);
-        return 0;
+    if ( eptep && is_epte_superpage(eptep) ) {
+
+        /* chop off top bits for indexing */
+        gfn_remainder &= (1UL << (i * EPT_TABLE_ORDER)) - 1;
+
+        if ( i == 3 ) {
+            kdbxp("superpage at level 3.. confused\n");
+            kdbxp("  entry:%lx gfn:%lx vp:%p\n", eptep->epte, gfn, vp);
+            return 0;
+
+        } else if ( i == 2 ) {
+            if ( pr_info )
+                kdbxp("1G page. top/root mfn:%lx indexed mfn:%lx\n", eptep->mfn,
+                      eptep->mfn + gfn_remainder);
+
+            return eptep->mfn + gfn_remainder;
+
+        } else if (i == 1 ) {
+            if ( pr_info )
+                kdbxp("2M page. top/root mfn:%lx indexed mfn:%lx\n", eptep->mfn,
+                      eptep->mfn + gfn_remainder);
+
+            return eptep->mfn + gfn_remainder;
+
+        } else {
+            kdbxp("Unexpected i = 0, return 0\n");
+            return 0;
+        }
     }
+
     mfn = eptep ? eptep->mfn : 0;
     KDBGP1("wept: return mfn:%lx\n", mfn);
 
@@ -4144,13 +4461,20 @@ kdb_cmdf_wept(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
-ulong kdbx_p2m(struct kvm_vcpu *vp, ulong gfn)
+ulong kdbx_p2m(struct kvm_vcpu *vp, ulong gfn, int slow_ok)
 {
-    ulong mfn;
+    ulong mfn = 0;
 
     KDBGP1("p2m: vp:%p gfn:%lx\n", vp, gfn);
-    if ( vp ) {
-        if ( (mfn=kdbx_ept_walk_table(vp, gfn, 0)) == 0 ) {
+    if (vp == NULL)
+        return gfn;   /* host: gfn is pfn */
+
+    mfn = kdbx_ept_walk_table(vp, gfn, 0);
+    if (mfn) {
+        KDBGP1("p2m ept ret: for gfn:%lx mfn:%lx\n", gfn, mfn);
+        return mfn;
+    }
+    if ( slow_ok ) {
             /* bad things will happen if gfn is not valid */
             struct kvm *kp = vp->kvm;
             struct kvm_memslots *slots = kvm_memslots(kp);
@@ -4175,11 +4499,10 @@ ulong kdbx_p2m(struct kvm_vcpu *vp, ulong gfn)
                     mfn = 0;
                 }
             }
-        }
-        KDBGP1("p2m ret: for gfn:%lx mfn:%lx\n", gfn, mfn);
-        return mfn;
     }
-    return gfn;   /* host: gfn is pfn */
+
+    KDBGP1("p2m ret: for gfn:%lx mfn:%lx\n", gfn, mfn);
+    return mfn;
 }
 EXPORT_SYMBOL_GPL(kdbx_p2m);
 
@@ -4198,7 +4521,7 @@ kdb_cmdf_p2m(int argc, const char **argv, struct pt_regs *regs)
         return kdb_usgf_p2m();
 
     if ( (vp=kdb_pidvcpustr2vcpu(argv[1], 0)) && kdb_str2ulong(argv[2], &gfn) ){
-        pfn = kdbx_p2m(vp, gfn);
+        pfn = kdbx_p2m(vp, gfn, 1);
         kdbxp("gfn: %016lx  pfn:%016lx\n", gfn, pfn);
     } else
         kdb_usgf_p2m();
@@ -4234,24 +4557,25 @@ static void kdb_display_kvm_mmu(struct kvm_vcpu_arch *ap)
 {
     unsigned long sz, offs;
     char buf[KSYM_NAME_LEN+1];
-    struct kvm_mmu *mm = ap ? &ap->mmu : NULL;
+    struct kvm_mmu *mmu = ap ? &ap->mmu : NULL;
 
-    if ( mm == NULL )
+    if ( mmu == NULL )
         return;
 
     kdbxp("    kvm_mmu mmu:\n");
 
-    kallsyms_lookup((ulong)mm->get_cr3, &sz, &offs, NULL, buf);
+    kallsyms_lookup((ulong)mmu->get_cr3, &sz, &offs, NULL, buf);
     kdbxp("      get_cr3:%s", buf);
-    kallsyms_lookup((ulong)mm->translate_gpa, &sz, &offs, NULL, buf);
-    kdbxp("      translate_gpa:%s\n", buf);
+    kallsyms_lookup((ulong)mmu->translate_gpa, &sz, &offs, NULL, buf);
+    kdbxp("  translate_gpa:%s", buf);
+    kdbxp("  page_fault:%s\n", kdbx_hostsym(mmu->page_fault));
 
-    kdbxp("      root_hpa:%016lx root_level:%x\n", mm->root_hpa,
-          mm->root_level);
-    kdbxp("      direct_map:%d nx:%d pae_root:%p lm_root:%p\n", mm->direct_map,
-          mm->nx, mm->pae_root, mm->lm_root);
-    kdbxp("      pdptrs[0]:%p  [1]:%p\n", mm->pdptrs[0], mm->pdptrs[1]); 
-    kdbxp("            [2]:%p  [3]:%p\n", mm->pdptrs[2], mm->pdptrs[3]); 
+    kdbxp("      root_hpa:%016lx root_level:%x\n", mmu->root_hpa,
+          mmu->root_level);
+    kdbxp("      direct_map:%d nx:%d pae_root:%p lm_root:%p\n", mmu->direct_map,
+          mmu->nx, mmu->pae_root, mmu->lm_root);
+    kdbxp("      pdptrs[0]:%p  [1]:%p\n", mmu->pdptrs[0], mmu->pdptrs[1]); 
+    kdbxp("            [2]:%p  [3]:%p\n", mmu->pdptrs[2], mmu->pdptrs[3]); 
 }
 
 static void kdb_display_varch(struct kvm_vcpu *vp)
@@ -4277,15 +4601,18 @@ static void kdb_display_varch(struct kvm_vcpu *vp)
           ap->hflags, ap->efer, ap->mp_state, ap->apf.halted);
     kdbxp("  apic_base:%016lx apic_att:%016lx apic:%p\n", ap->apic_base,
           ap->apic_attention, ap->apic);
-    kdbxp("  mtrr_state:%p pat:%016lx tpr_acc:%d\n", &ap->mtrr_state, ap->pat,
-          !!ap->tpr_access_reporting);
-    kdbxp("  mmio_gva:%016lx access:%x gfn:%016lx\n", ap->mmio_gva,
-          ap->access, ap->mmio_gfn);
+    kdbxp("  lapic_in_kernel: %d\n", lapic_in_kernel(vp));
     kdbxp("  queued exception: pend:%d injected:%d nr:%d err:%d errcode:%d\n", 
           qe->pending, qe->injected, qe->nr, qe->has_error_code, 
           qe->error_code);
     kdbxp("  queued interrupt: injected:%d soft:%d nr:%d\n", 
           qi->injected, qi->soft, qi->nr);
+    //kdbxp("  pvirq_pending:%d  queued interrupt: injected:%d soft:%d nr:%d\n",
+          // vp->pvirq_pending, qi->injected, qi->soft, qi->nr);
+    kdbxp("  mtrr_state:%p pat:%016lx tpr_acc:%d\n", &ap->mtrr_state, ap->pat,
+          !!ap->tpr_access_reporting);
+    kdbxp("  mmio_gva:%016lx access:%x gfn:%016lx\n", ap->mmio_gva,
+          ap->access, ap->mmio_gfn);
     kdbxp("  exit_qual:%016lx fault_shad:%d pv_unhalt:%d\n", 
           ap->exit_qualification, !!ap->write_fault_to_shadow_pgtable, 
           !!ap->pv.pv_unhalted);
@@ -4377,7 +4704,7 @@ kdb_cmdf_vcpu(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
-static void kdbx_disp_struct_device(struct device *dev, int prshort)
+static void kdbx_disp_struct_device(struct device *dev)
 {
     kdbxp("  device: name:%s  device_type name:%s\n",
           dev_name(dev), dev->type ? dev->type->name : "\0"); 
@@ -4386,10 +4713,8 @@ static void kdbx_disp_struct_device(struct device *dev, int prshort)
           dev->bus ? dev->bus->dev_name : "\0",
           dev->driver ? dev->driver->name : "\0", 
           dev->driver ? dev->driver->mod_name : "\0");
-    
-    if (prshort)
-        return;
-    /* long info, dump more */
+    kdbxp("    driver_data:%p devt:%x(%u) id:%d\n", dev->driver_data,
+          dev->devt, dev->devt, dev->id);
 }
 
 /* also called from virtio_scsi.c */
@@ -4402,7 +4727,7 @@ void kdbx_disp_virtio_device(struct virtio_device *vdevp, int prshort)
     if ( dev == NULL )
         return;
 
-    kdbx_disp_struct_device(dev, 1);
+    kdbx_disp_struct_device(dev);
 }
 
 static void kdbx_disp_scsi_host(struct Scsi_Host *sh)
@@ -4571,7 +4896,7 @@ static int kdbx_display_virtio_driver(struct virtio_driver *vdrvr)
 
 static kdbx_cpu_cmd_t kdb_usgf_viodev(void)
 {
-    kdbxp("display struct virtio_device{}\n");
+    kdbxp("viodev ptr: display struct virtio_device{}\n");
     return KDB_CPU_MAIN_KDB;
 }
 static kdbx_cpu_cmd_t
@@ -4588,7 +4913,7 @@ kdb_cmdf_viodev(int argc, const char **argv, struct pt_regs *regs)
 
 static kdbx_cpu_cmd_t kdb_usgf_viodrvr(void)
 {
-    kdbxp("display struct virtio_driver{}\n");
+    kdbxp("viodrvr ptr: display struct virtio_driver{}\n");
     return KDB_CPU_MAIN_KDB;
 }
 static kdbx_cpu_cmd_t
@@ -4638,7 +4963,8 @@ kdb_cmdf_viopcidev(int argc, const char **argv, struct pt_regs *regs)
 
 static kdbx_cpu_cmd_t kdb_usgf_vbusdevs(void)
 {
-    kdbxp("list virtio devices on virtbus, and devices for those drivers\n");
+    kdbxp("vbusdevs: list virtio devices on virtbus, and devices for");
+    kdbxp(" those drivers\n");
     return KDB_CPU_MAIN_KDB;
 }
 static kdbx_cpu_cmd_t
@@ -4658,7 +4984,8 @@ static int kdbx_display_vdrvr_cb(struct device_driver *drvr, void *data)
 
 static kdbx_cpu_cmd_t kdb_usgf_vbusdrvrs(void)
 {
-    kdbxp("list virtio drivers on virtbus, and devices for those drivers\n");
+    kdbxp("vbusdrvrs: list virtio drivers on virtbus, and devices for");
+    kdbxp(" those drivers\n");
     return KDB_CPU_MAIN_KDB;
 }
 static kdbx_cpu_cmd_t
@@ -4731,10 +5058,43 @@ kdb_cmdf_kvmiodevs(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
+static char *chipmode_tostr(enum kvm_irqchip_mode mode)
+{
+    switch (mode) {
+        case KVM_IRQCHIP_NONE:
+            return "KVM_IRQCHIP_NONE";
+        case KVM_IRQCHIP_KERNEL:
+            return "KVM_IRQCHIP_KERNEL";
+        case KVM_IRQCHIP_SPLIT:
+            return "KVM_IRQCHIP_SPLIT";
+    }
+    return " ??? ";
+}
+
+static void kdbx_dump_memslots(struct kvm_memslots *km)
+{
+    int i;
+
+    kdbxp("  memslots:%p  used_slots:%d  generation:%x\n", km, 
+          km->used_slots, km->generation);
+
+    #define fs "    "
+    for (i=0; i < KVM_MEM_SLOTS_NUM; i++) {
+        struct kvm_memory_slot *ks = &km->memslots[i];
+
+        if (ks->npages == 0)
+            continue;
+        kdbxp("%s[%d]: base_gfn:%p npages:%x\n",fs,i,ks->base_gfn, ks->npages);
+        kdbxp("%s     uaddr:%016lx flags:%x id:%hx\n", fs, ks->userspace_addr,
+              ks->flags, ks->id);
+    }
+    kdbxp("\n");
+    #undef fs
+}
+
 static void kdb_display_kvm_struct(struct kvm *kp)
 {
     int i;
-    struct kvm_memslots *km;
     struct kvm_arch *ka;
     struct kvm_vcpu *vp;
     struct task_struct *tp;
@@ -4751,11 +5111,14 @@ static void kdb_display_kvm_struct(struct kvm *kp)
               tp ? tp->pid : -1, tp ? tp->tgid : -1);
     }
     kdbxp("\n");
-    kdbxp("  users_count: %d &kvm_vm_stat:%p\n", kp->users_count, &kp->stat);
+    kdbxp("  userspace_pid:%d  users_count:%d  &kvm_vm_stat:%p\n",
+          kp->userspace_pid, kp->users_count, &kp->stat);
 
     ka = &kp->arch;
     kdbxp("  kvm arch: n_used_mmu_pages:%x requested:%x max:%x\n",
           ka->n_used_mmu_pages, ka->n_requested_mmu_pages, ka->n_max_mmu_pages);
+    kdbxp("     IRQ: vpic:%p  vioapic:%p\n", ka->vpic, ka->vioapic); 
+    kdbxp("          irqchip_mode: %s\n", chipmode_tostr(ka->irqchip_mode));
 #if 0
 /* moved to vmx.c in kvm_vmx in 4.14.35-1831. grrr */
     kdbxp("      ept_id_pg_done:%d ept_identity_map_addr:%p\n",
@@ -4764,23 +5127,13 @@ static void kdb_display_kvm_struct(struct kvm *kp)
           !!ka->ept_identity_pagetable_done, ka->irq_sources_bitmap);
 #endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,4,0)
-    km = kp->memslots;
-#else
-    km = kp->memslots[0];
-#endif
+    kdbx_dump_memslots(kp->memslots);
     kdbxp("\n");
-    kdbxp("  memslots: %p generation:%x\n", km->memslots[0], km->generation);
-    #define fs "    "
-    for (i=0; i < KVM_MEM_SLOTS_NUM; i++) {
-        struct kvm_memory_slot *ks = &km->memslots[i];
-
-        if (ks->npages == 0)
-            continue;
-        kdbxp("%s[%d]: base_gfn:%p npages:%x\n",fs,i,ks->base_gfn, ks->npages);
-        kdbxp("%s     uaddr:%016lx flags:%x id:%hx\n", fs, ks->userspace_addr,
-              ks->flags, ks->id);
-    }
-    #undef fs
+#else
+    kdbxp("  \nKVM_ADDRESS_SPACE_NUM: %d\n", KVM_ADDRESS_SPACE_NUM);
+    for (i=0; i < KVM_ADDRESS_SPACE_NUM; i++)
+        kdbx_dump_memslots(kp->memslots[i]);
+#endif
 }
 
 static kdbx_cpu_cmd_t kdb_usgf_skvm(void)
@@ -4822,14 +5175,14 @@ kdb_cmdf_vms(int argc, const char **argv, struct pt_regs *regs)
     struct list_head *lp;
     struct task_struct *tp;
     kdbva_t addr;
-    pid_t pid, tgid = 0;
+    pid_t pid, tgid;
     int i;
 
     kdbxp("vp vcpu-id state(0==KVM_MP_STATE_RUNNABLE) IP\n");
     list_for_each(lp, &vm_list) {
         struct kvm *kp = list_entry(lp, struct kvm, vm_list); /* container of*/
 
-        for (i=0; i < KVM_MAX_VCPUS; i++) {
+        for (i=0, tgid=0; i < KVM_MAX_VCPUS; i++) {
             if ( (vp = kp->vcpus[i]) == NULL )
                 continue;
 
@@ -5007,6 +5360,11 @@ static void kdb_show_cpu_masks(void)
 {
     int cpu;
 
+    kdbxp("num_online_cpus: %d\n", num_online_cpus());
+    kdbxp("num_possible_cpus: %d\n", num_possible_cpus());
+    kdbxp("num_present_cpus: %d\n", num_present_cpus());
+    kdbxp("num_active_cpus: %d\n", num_active_cpus());
+
     kdbxp("cpus possible:");
     for_each_cpu(cpu, cpu_possible_mask)
         kdbxp(" %d", cpu);
@@ -5066,6 +5424,10 @@ kdb_cmdf_info(int argc, const char **argv, struct pt_regs *regs)
     kdb_show_cpu_masks();
     kdb_show_sched_info();
 
+    kdbxp("\nTIMER stuff:\n");
+    kdbxp("MAX_JIFFY_OFFSET: %lx\n", MAX_JIFFY_OFFSET);
+    kdbxp("HZ: %lx\n", HZ);
+
     return KDB_CPU_MAIN_KDB;
 }
 
@@ -5098,7 +5460,7 @@ static kdbx_cpu_cmd_t kdb_usgf_cur(void)
 static kdbx_cpu_cmd_t
 kdb_cmdf_cur(int argc, const char **argv, struct pt_regs *regs)
 {
-    int cpu, ccpu = smp_processor_id();
+    int i, cpu, ccpu = smp_processor_id();
 
     if ( argc > 1 && strcmp(argv[1], "all") )
         return kdb_usgf_cur();
@@ -5113,13 +5475,19 @@ kdb_cmdf_cur(int argc, const char **argv, struct pt_regs *regs)
                 if (kdbx_cpu_cmd[cpu] != KDB_CPU_PAUSE)   /* hung cpu */
                     continue;
                 kdbx_cpu_cmd[cpu] = KDB_CPU_SHOW_CUR;
-                while (kdbx_cpu_cmd[cpu] == KDB_CPU_SHOW_CUR);
+                for (i = 0; kdbx_cpu_cmd[cpu] == KDB_CPU_SHOW_CUR; i++) {
+                    if (i < 1000)
+                        mdelay(1);
+                }
+                if ( kdbx_cpu_cmd[cpu] == KDB_CPU_SHOW_CUR )
+                    kdbxp("Giving up on cpu: %d\n", cpu);
             }
         }
     }
     return KDB_CPU_MAIN_KDB;
 }
 
+#if 0
 #define KDBX_MAX_VHOST_SAV 256
 struct kdbx_vhostdevs_sav {
     struct vhost_dev *vhdev;
@@ -5143,6 +5511,7 @@ void kdbx_sav_vhost_dev(struct vhost_dev *dev, char *type)
         kdbxp(">>>>>>>>> vhost_devs array FULL!!!|\n");
 }
 EXPORT_SYMBOL_GPL(kdbx_sav_vhost_dev);
+#endif
 
 static kdbx_cpu_cmd_t kdb_usgf_vhostdevs(void)
 {
@@ -5153,6 +5522,10 @@ static kdbx_cpu_cmd_t kdb_usgf_vhostdevs(void)
 static kdbx_cpu_cmd_t
 kdb_cmdf_vhostdevs(int argc, const char **argv, struct pt_regs *regs)
 {
+
+    kdbxp("FIXME: old code is gone\n");
+
+#if 0
     int i;
 
     kdbxp("  (make sure: vhost net/scsi mods compiled with kdbx)\n");
@@ -5164,6 +5537,7 @@ kdb_cmdf_vhostdevs(int argc, const char **argv, struct pt_regs *regs)
         kdbxp("dev:%p type:%s worker:(%d)%s\n", p->vhdev, p->dev_type,
               p->vhdev->worker->pid, p->vhdev->worker->comm);
     }
+#endif
     return KDB_CPU_MAIN_KDB;
 }
 
@@ -5182,83 +5556,191 @@ kdb_cmdf_devices(int argc, const char **argv, struct pt_regs *regs)
 }
 #endif
 
-static kdbx_cpu_cmd_t kdb_usgf_bio(void)
+static void kdbx_dump_bio(struct bio *bp, int for_each_all)
 {
-    kdbxp("bio addr: display struct bio (include/linux/blk_types.h)\n");
-    return KDB_CPU_MAIN_KDB;
-}
-static kdbx_cpu_cmd_t
-kdb_cmdf_bio(int argc, const char **argv, struct pt_regs *regs)
-{
-    struct bio *bp;   /* include/linux/blk_types.h */
+    int i;
+    struct bvec_iter iter;
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
     struct block_device *bd;
 #else
     struct gendisk *gd;                   /* include/linux/genhd.h */
 #endif
+    kdbxp("bio: %p\n", bp);
+    kdbxp(" bi_sector: %lx  bi_partno:%1u  bi_next:%p\n", bp->bi_iter.bi_sector,
+          bp->bi_partno, bp->bi_next);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,9,0)
+    kdbxp(" bi_flags: %lx  bi_rw:%lx  op_is_flush:%d\n", bp->bi_flags,
+          bp->bi_rw, op_is_flush(bp->bi_opf));
+#else
+    /* sync flag appears to be ignored, so ignore op_is_sync() */
+    kdbxp(" bi_flags: %lx  bi_opf(rw):%lx  op_is: flush:%d  sync:%d\n",
+          bp->bi_flags, bp->bi_opf, op_is_flush(bp->bi_opf),
+          op_is_sync(bp->bi_opf));
+#endif
+    kdbxp(" bi_end_io:%p  bi_private:%p\n", bp->bi_end_io, bp->bi_private);
+    kdbxp(" iter.bi_idx:%hd  iter.bi_size:%x  __bi_remaining:%d\n",
+          bp->bi_iter.bi_idx, bp->bi_iter.bi_size,
+          atomic_read(&bp->__bi_remaining));
+    kdbxp(" bi_vcnt:%hx/$%d bi_phys_segments:%x/$%d bio_segments(bio):%x/$%d\n",
+          bp->bi_vcnt, bp->bi_vcnt, bp->bi_phys_segments, bp->bi_phys_segments,
+          bio_segments(bp), bio_segments(bp));
+    kdbxp(" bi_io_vec:%p  bi_inline_vecs:%p\n", bp->bi_io_vec,
+          bp->bi_inline_vecs);
+    if (for_each_all) {
+        struct bio_vec *bvec;
+
+        kdbxp(" bio_for_each_segment_all:\n");
+        bio_for_each_segment_all(bvec, bp, i)
+            kdbxp("   page: %p (pfn:%x)  len: %x/$%d  offset: $%d\n",
+                  bvec->bv_page, page_to_pfn(bvec->bv_page), bvec->bv_len,
+                  bvec->bv_len, bvec->bv_offset);
+    } else {
+        struct bio_vec bvec;
+
+        kdbxp(" bio_for_each_segment:\n");
+        bio_for_each_segment(bvec, bp, iter) {
+            kdbxp("   page: %p (pfn:%x)  len: %x/$%d  offset: $%d\n",
+                  bvec.bv_page, page_to_pfn(bvec.bv_page), bvec.bv_len,
+                  bvec.bv_len, bvec.bv_offset);
+        }
+    }
+    kdbxp("\n"); 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
+    bd = bp->bi_bdev;
+    kdbxp(" block device: bi_bdev:%p\n", bd);
+    kdbxp("    bd_dev:%lx request_queue:%p\n", bd->bd_dev, bd->bd_queue);
+#else
+    gd = bp->bi_disk;
+    kdbxp(" gendisk: %p  major:$%d  first_minor:$%d  minors:$%d\n", 
+          gd, gd->major, gd->first_minor, gd->minors);
+    kdbxp("  devnode:%p  disk_name: %s\n", gd->devnode, gd->disk_name);
+    kdbxp("  request_queue: %p  private_data:%p\n", gd->queue, 
+          gd->private_data);
+#endif
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_bio(void)
+{
+    kdbxp("bio addr [all]: display struct bio (include/linux/blk_types.h)\n");
+    kdbxp("  all => use bio_for_each_segment_all to dump iovecs\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_bio(int argc, const char **argv, struct pt_regs *regs)
+{
+    struct bio *bp;   /* include/linux/blk_types.h */
+    int for_each_all = 0;
 
     if (argc < 2)
         return kdb_usgf_bio();
+
+    if (argc >=3 && !strcmp(argv[2], "all"))
+        for_each_all = 1;
 
     if (!kdb_str2addr(argv[1], (kdbva_t *)&bp, 0)) {
         kdbxp("Invalid addr: %lx\n", bp);
         return KDB_CPU_MAIN_KDB;
     }
-    kdbxp("bio: %p\n", bp);
-    kdbxp("  bi_sector: %lx  bi_next:%p\n", bp->bi_iter.bi_sector, bp->bi_next);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,9,0)
-    kdbxp("  bi_flags: %lx  bi_rw:%lx  op_is_flush:%d\n", bp->bi_flags,
-          bp->bi_rw, op_is_flush(bp->bi_opf));
-#else
-    kdbxp("  bi_flags: %lx  bi_opf(rw):%lx  op_is: flush:%d  sync:%d\n",
-          bp->bi_flags, bp->bi_opf, op_is_flush(bp->bi_opf),
-          op_is_sync(bp->bi_opf));
-#endif
-    kdbxp("  bi_vcnt:%hx  bi_idx:%hd  bi_size:%x  bi_phys_segments:%x\n",
-          bp->bi_vcnt, bp->bi_iter.bi_idx, bp->bi_iter.bi_size, 
-          bp->bi_phys_segments);
-    kdbxp("  bi_end_io:%p  bi_private:%p\n", bp->bi_end_io, bp->bi_private);
-    kdbxp("\n"); 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
-    bd = bp->bi_bdev;
-    kdbxp("  block device: bi_bdev:%p\n", bd);
-    kdbxp("    bd_dev:%lx request_queue:%p\n", bd->bd_dev, bd->bd_queue);
-#else
-    gd = bp->bi_disk;
-    kdbxp("    gendisk: %p  major:$%d  first_minor:$%d  minors:$%d\n", 
-          gd, gd->major, gd->first_minor, gd->minors);
-    kdbxp("    devnode:%p  disk_name: %s\n", gd->devnode, gd->disk_name);
-    kdbxp("    request_queue: %p  private_data:%p\n", gd->queue, 
-          gd->private_data);
-#endif
 
+    kdbx_dump_bio(bp, for_each_all);
     return KDB_CPU_MAIN_KDB;
 }
 
-static kdbx_cpu_cmd_t kdb_usgf_req(void)
+static int kdbx_request_segments(struct request *req)
 {
-    kdbxp("req addr: display struct request for block device\n");
+    struct req_iterator iter;
+    struct bio_vec bvec;
+    int i = 0;
+
+    rq_for_each_segment(bvec, req, iter)
+        i++;
+    return i;
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_request(void)
+{
+    kdbxp("request addr: display block layer struct request\n");
     return KDB_CPU_MAIN_KDB;
 }
 static kdbx_cpu_cmd_t
-kdb_cmdf_req(int argc, const char **argv, struct pt_regs *regs)
+kdb_cmdf_request(int argc, const char **argv, struct pt_regs *regs)
 {
     struct request *req;      /* include/linux/blkdev.h */
 
     if (argc < 2)
-        return kdb_usgf_req();
+        return kdb_usgf_request();
 
     if (!kdb_str2addr(argv[1], (kdbva_t *)&req, 0)) {
         kdbxp("Invalid addr: %lx\n", req);
         return KDB_CPU_MAIN_KDB;
     }
-    kdbxp("request: %p  reqq: %p  cpu: %d\n", req, req->q, req->cpu);
-    kdbxp("  cmd_flags(srch req_opf): %x  rq_flags(RQF_QUEUED): %x\n",
-          req->cmd_flags, req->rq_flags);
+    kdbxp("struct request: %p  reqq: %p  cpu: %d\n", req, req->q, req->cpu);
+    kdbxp("  cmd_flags(srch req_opf):0x%x  req_op(req)(not bit flag):0x%x\n",
+          req->cmd_flags, req_op(req));
+    kdbxp("  rq_flags(RQF_QUEUED): %x  sector: %x\n", req->rq_flags,
+          req->__sector);
+    kdbxp("  __data_len: $%d nr_phys_segs:$%d rq_for_each:$%d\n", 
+          req->__data_len, blk_rq_nr_phys_segments(req),
+          kdbx_request_segments(req));
     kdbxp("  bio: %p  gendisk: %p\n", req->bio, req->rq_disk);
-    kdbxp("  hd_struct: %p  end_io: %s\n", req->part,kdbx_hostsym(req->end_io));
+    kdbxp("  hd_struct: %p end_io: %s\n",req->part,kdbx_hostsym(req->end_io));
+    kdbxp("  end_io_data: %p  next_rq: %s\n", req->end_io_data, req->next_rq);
+
     return KDB_CPU_MAIN_KDB;
+}
+
+static void kdbxp_dump_reqq(struct request_queue *rq)
+{
+    char *bd_name;
+    struct queue_limits *ql = &rq->limits;
+
+    kdbxp("request queue: %p\n", rq);
+    kdbxp(" request_fn: %s  make_request_fn: %s\n", 
+          kdbx_hostsym(rq->request_fn), kdbx_hostsym(rq->make_request_fn)); 
+    kdbxp(" softirq_done_fn: %s  prep_rq_fn: %s\n", 
+          kdbx_hostsym(rq->softirq_done_fn), kdbx_hostsym(rq->prep_rq_fn)); 
+    kdbxp(" elevator: %p  blk_mq_ops: %p\n", rq->elevator, rq->mq_ops);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
+    bd_name = (char *)rq->backing_dev_info->name;
+#else
+    bd_name = rq->backing_dev_info.name;
+#endif
+
+    kdbxp(" nr_queues:$%d  queue_depth:$%d  nr_hw_queues:$%d\n", rq->nr_queues,
+          rq->queue_depth, rq->nr_hw_queues);
+    kdbxp(" queue_flags:%lx  end_sector:%lx  backing_dev name:%s\n",
+          rq->queue_flags, rq->end_sector, bd_name);
+    kdbxp(" nr_requests:$%d  nr_batching:$%d  nr_congestion_on:$%d\n",
+          rq->nr_requests, rq->nr_batching, rq->nr_congestion_on);
+    kdbxp(" nr_congestion_off:$%d  request_fn_active:%d  queuedata:%p\n",
+          rq->nr_congestion_off, rq->request_fn_active, rq->queuedata);
+    if ( ql == NULL )
+        return;
+
+    kdbxp(" LIMITS (struct queue_limit): %p  (all dec except first row)\n", ql);
+    kdbxp("  bounce_pfn:%lx  seg_boundary_mask:%lx  virt_boundary_mask:%lx\n",
+          ql->bounce_pfn, ql->seg_boundary_mask, ql->virt_boundary_mask);
+    kdbxp("  max_hw_sectors:%u  max_dev_sectors:%u  max_sectors:%u\n",
+          ql->max_hw_sectors, ql->max_dev_sectors, ql->max_sectors);
+    kdbxp("  max_segment_size:%u  physical_block_size:%u  alignment_offset:%u\n"
+          ,ql->max_segment_size, ql->physical_block_size, ql->alignment_offset);
+    kdbxp("  chunk_sectors:%u  io_min:%u  io_opt:%u  max_discard_sectors:%u\n", 
+          ql->chunk_sectors, ql->io_min, ql->io_opt, ql->max_discard_sectors);
+    kdbxp("  max_hw_discard_sectors:%u  max_write_same_sectors:%u\n",
+          ql->max_hw_discard_sectors, ql->max_write_same_sectors);
+    kdbxp("  max_write_zeroes_sectors:%u  discard_granularity:%u\n",
+          ql->max_write_zeroes_sectors, ql->discard_granularity);
+    kdbxp("  discard_alignment:%u  max_discard_segments:%u\n",
+          ql->discard_alignment, ql->max_discard_segments);
+    kdbxp("  max_integrity_segments:%u  logical_block_size:%u"
+          "  max_segments:%u\n", ql->max_integrity_segments,
+          ql->logical_block_size, ql->max_segments);
+    kdbxp("  misaligned:%c  discard_misaligned:%c\n", ql->misaligned,
+          ql->discard_misaligned);
+    kdbxp("  cluster:%c  raid_partial_stripes_expensive:%c  zoned:%d\n",
+          ql->cluster, ql->raid_partial_stripes_expensive, ql->zoned);
 }
 
 static kdbx_cpu_cmd_t kdb_usgf_reqq(void)
@@ -5270,7 +5752,6 @@ static kdbx_cpu_cmd_t
 kdb_cmdf_reqq(int argc, const char **argv, struct pt_regs *regs)
 {
     struct request_queue *rq;      /* include/linux/blkdev.h */
-    char *bd_name;
 
     if (argc < 2)
         return kdb_usgf_reqq();
@@ -5279,41 +5760,63 @@ kdb_cmdf_reqq(int argc, const char **argv, struct pt_regs *regs)
         kdbxp("Invalid addr: %lx\n", rq);
         return KDB_CPU_MAIN_KDB;
     }
-    kdbxp("request queue: %p\n", rq);
-    kdbxp("  request_fn: %s  make_request_fn: %s\n", 
-          kdbx_hostsym(rq->request_fn), kdbx_hostsym(rq->make_request_fn)); 
-    kdbxp("  softirq_done_fn: %s  prep_rq_fn: %s\n", 
-          kdbx_hostsym(rq->softirq_done_fn), kdbx_hostsym(rq->prep_rq_fn)); 
-    kdbxp("  elevator: %p  blk_mq_ops: %p\n", rq->elevator, rq->mq_ops);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
-    bd_name = (char *)rq->backing_dev_info->name;
-#else
-    bd_name = rq->backing_dev_info.name;
-#endif
+    kdbxp_dump_reqq(rq);
+    return KDB_CPU_MAIN_KDB;
+}
 
-    kdbxp("  nr_queues:%x  nr_hw_queues:%x", rq->nr_queues, rq->nr_hw_queues);
-    kdbxp("    end_sector:%lx  backing_dev name:%s\n", rq->end_sector, bd_name);
-    kdbxp("  nr_requests:%lx  request_fn_active:%d", rq->nr_requests,
-          rq->request_fn_active);
-    kdbxp("    queuedata: %p\n", rq->queuedata);
+/* also called from kdbx_dump_nvmes from drivers/nvme/host/pci.c */
+void kdbx_prnt_tagset(struct blk_mq_tag_set *ts)
+{
+    int i;
+    struct blk_mq_tags **mqt;
+
+    kdbxp(" blk_mq_tag_set: %p\n", ts);
+    kdbxp("   nr_hw_queues:%u  queue_depth:%u  cmd_size:%u\n", ts->nr_hw_queues,
+          ts->queue_depth, ts->cmd_size);
+    kdbxp("   numa_node:%d  flags:0x%x(eg BLK_MQ_F_BLOCKING)  driver_data:%p\n",
+          ts->numa_node, ts->flags, ts->driver_data);
+
+    kdbxp("   blk_mq_tags:\n");
+    for (i=0, mqt = ts->tags; mqt && mqt[i] && i < ts->nr_hw_queues; i++)
+        kdbxp("       [%d]nr_tags:%u  active_queues:%u\n", i, mqt[i]->nr_tags,
+              mqt[i]->active_queues);
+    kdbxp("\n");
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_tagset(void)
+{
+    kdbxp("tagset ptr: dump struct blk_mq_tag_set\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t kdb_cmdf_tagset(int argc, const char **argv, 
+                                      struct pt_regs *regs)
+{
+    struct blk_mq_tag_set *ts;
+
+    if (argc <= 1 || !kdb_str2ulong(argv[1], (ulong *)&ts) )
+        return kdb_usgf_tagset();
+
+    kdbx_prnt_tagset(ts);
 
     return KDB_CPU_MAIN_KDB;
 }
 
 static void kdbx_disp_block_device(struct block_device *bdev)
 {
+    char *nm = bdev->bd_disk ? bdev->bd_disk->disk_name : "";
+
     if ( !bdev )
         return;
 
-    kdbxp("block_device: %p  major: %d  minor: %d\n", bdev,
-          MAJOR(bdev->bd_dev),  MINOR(bdev->bd_dev)); 
-    kdbxp("  openers: %d  inode: %p  block_size: %d\n", bdev->bd_openers,
-          bdev->bd_inode, bdev->bd_block_size);
+    kdbxp("block_device:%p   major:%d   minor:%d  NAME:%s\n", bdev,
+          MAJOR(bdev->bd_dev),  MINOR(bdev->bd_dev), nm); 
+    kdbxp("  holder:%p openers:%d  inode:%p  block_size:%d\n", bdev->bd_holder,
+          bdev->bd_openers, bdev->bd_inode, bdev->bd_block_size);
     kdbxp("  partno: %d  part_count: %d invalidated: %d\n", bdev->bd_partno,
           bdev->bd_part_count, bdev->bd_invalidated);
     kdbxp("  hd_struct/part: %p  gendisk: %p (%s)\n", bdev->bd_part,
-          bdev->bd_disk, bdev->bd_disk ? bdev->bd_disk->disk_name : "");
+          bdev->bd_disk, nm);
     kdbxp("  request_queue: %p  private: %lx\n", bdev->bd_queue,
           bdev->bd_private);
 
@@ -5321,6 +5824,33 @@ static void kdbx_disp_block_device(struct block_device *bdev)
         return;
     kdbxp("  backing_dev_info:%p {.name:%s  .device: %p}\n\n", 
          bdev->bd_bdi, bdev->bd_bdi->name, bdev->bd_bdi->dev);
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_blkdev(void)
+{
+    kdbxp("blkdev ptr: dump block device\n");
+    return KDB_CPU_MAIN_KDB;
+}
+
+/* fs/block_dev.c: iterate_bdevs() takes many spin locks, so avoid that */
+static kdbx_cpu_cmd_t kdb_cmdf_blkdev(int argc, const char **argv, 
+                                      struct pt_regs *regs)
+{
+    struct block_device *bdev;
+    struct inode *inode;
+
+    if (argc <= 1 || !kdb_str2ulong(argv[1], (ulong *)&bdev) )
+        return kdb_usgf_blkdev();
+
+    kdbxp("maj/minor openers block_size partno part_count inval DECIMAL\n");
+    list_for_each_entry(inode, &blockdev_superblock->s_inodes, i_sb_list) {
+        if (inode->i_state & (I_FREEING|I_WILL_FREE|I_NEW) )
+            continue;
+
+        if (I_BDEV(inode) == bdev)
+            kdbx_disp_block_device(bdev);
+    }
+    return KDB_CPU_MAIN_KDB;
 }
 
 static kdbx_cpu_cmd_t kdb_usgf_blkdevs(void)
@@ -5342,20 +5872,74 @@ static kdbx_cpu_cmd_t kdb_cmdf_blkdevs(int argc, const char **argv,
         kdbx_disp_block_device(I_BDEV(inode));
     }
     return KDB_CPU_MAIN_KDB;
-    
+}
+
+static void kdbx_dump_gendisk(struct gendisk *gd)
+{
+    int i;
+    struct hd_struct *part;         /* disk partition: linux/genhd.h */
+    const struct block_device_operations *fops = gd ? gd->fops : NULL;
+
+    kdbxp("  gendisk(%p): disknm:%s  major:%d  first minor:%d\n",
+              gd, gd->disk_name, gd->major, gd->first_minor);
+    kdbxp("    request_queue:%p  private_data:%p  sync_io: %d\n",
+              gd->queue, gd->private_data, gd->sync_io.counter);
+
+    if ( fops ) {
+        /* kdbx_hostsym uses static buf, hence only one per kdbxp */
+        kdbxp("    dev fops: owner:%s  open:%s  ioctl:%s",
+              fops->owner ? fops->owner->name : "", 
+              kdbx_hostsym(fops->open), kdbx_hostsym(fops->ioctl));
+        kdbxp("  rw_page:%s\n", kdbx_hostsym(fops->rw_page));
+    }
+
+    part = &gd->part0;
+    kdbxp("    part0:  start_sect:%lu  nr_sects: %lu  nr_sects_seq:%u\n",
+          part->start_sect, part->nr_sects, part->nr_sects_seq);
+    kdbxp("           alignment_offset:%lu  discard_alignment:%u\n", 
+          part->alignment_offset, part->discard_alignment);
+
+    if ( gd->part_tbl == NULL || gd->part_tbl->len == 0 ) {
+            kdbxp("\n");
+            return;
+    }
+    /* entry zero points to part0 above */
+    for (i=0; i < gd->part_tbl->len; i++ ) {
+            part = gd->part_tbl->part[i];
+            kdbxp("    partition %d: start_sect:$%lu  nr_sects:$%lu\n",
+                  i, part->start_sect, part->nr_sects);
+    }
+    kdbxp("\n");
+}
+
+/* see genhd_device_init: class_register(&block_class) */
+static kdbx_cpu_cmd_t kdb_usgf_gendisk(void)
+{
+    kdbxp("gendisk ptr: dump struct gendisk \n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t kdb_cmdf_gendisk(int argc, const char **argv, 
+                                       struct pt_regs *regs)
+{
+    struct gendisk *gd;
+
+    if (argc < 2 || !kdb_str2addr(argv[1], (kdbva_t *)&gd, 0)) {
+        kdbxp("Missing or Invalid gendisk arg: %lx\n", gd);
+        return KDB_CPU_MAIN_KDB;
+    }
+    kdbx_dump_gendisk(gd);
+    return KDB_CPU_MAIN_KDB;
 }
 
 /* see genhd_device_init: class_register(&block_class) */
 static kdbx_cpu_cmd_t kdb_usgf_disks(void)
 {
-    kdbxp("disks: list disk/gendisk devices\n");
+    kdbxp("disks: list disk devices\n");
     return KDB_CPU_MAIN_KDB;
 }
 static kdbx_cpu_cmd_t kdb_cmdf_disks(int argc, const char **argv, 
-                                       struct pt_regs *regs)
+                                     struct pt_regs *regs)
 {
-    int i;
-    struct hd_struct *part;      /* disk partition: linux/genhd.h */
     struct class_dev_iter iter;
     struct device *dev;          /* include/linux/device.h */
 
@@ -5363,9 +5947,7 @@ static kdbx_cpu_cmd_t kdb_cmdf_disks(int argc, const char **argv,
     class_dev_iter_init(&iter, &block_class, NULL, NULL);
     while ((dev = class_dev_iter_next(&iter))) {
         struct gendisk *gd = dev_to_disk(dev); /*  include/linux/genhd.h */
-        const struct block_device_operations *fops = gd ? gd->fops : NULL;
 
-        // kdbx_disp_struct_device(dev, 0); 
         kdbxp("device: name:%s  device_type name:%s\n", dev_name(dev),
               dev->type ? dev->type->name : "\0"); 
 
@@ -5374,36 +5956,106 @@ static kdbx_cpu_cmd_t kdb_cmdf_disks(int argc, const char **argv,
             kdbxp("\n");
             continue;
         }
-        kdbxp("  gendisk(%p): disknm:%s major: %d  first minor: %d\n",
-              gd, gd->disk_name, gd->major, gd->first_minor);
-        kdbxp("    request_queue: %p  private_data: %p sync_io: %d\n",
-              gd->queue, gd->private_data, gd->sync_io.counter);
-        if ( !fops )
-            continue;
 
-        /* kdbx_hostsym uses static buf, hence only one per kdbxp */
-        kdbxp("    dev ops: owner:%s  open: %s  ioctl:%s",
-              fops->owner ? fops->owner->name : "", 
-              kdbx_hostsym(fops->open), kdbx_hostsym(fops->ioctl));
-        kdbxp("  rw_page: %s\n", kdbx_hostsym(fops->rw_page));
-
-        part = &gd->part0;
-        kdbxp("    part0: start_sect: %d  nr_sects: %d\n",
-              part->start_sect, part->nr_sects);
-        if ( gd->part_tbl == NULL || gd->part_tbl->len == 0 ) {
-            kdbxp("\n");
-            continue;
-        }
-        /* entry zero points to part0 above */
-        for (i=0; i < gd->part_tbl->len; i++ ) {
-            part = gd->part_tbl->part[i];
-            kdbxp("    partition %d: start_sect: %d  nr_sects: %d\n",
-                  i, part->start_sect, part->nr_sects);
-        }
-        kdbxp("\n");
+        kdbx_dump_gendisk(gd);
     }
     class_dev_iter_exit(&iter);
 
+    return KDB_CPU_MAIN_KDB;
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_nvmes(void)
+{
+    kdbxp("nvmes: list nvmes devices\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t kdb_cmdf_nvmes(int argc, const char **argv, 
+                                     struct pt_regs *regs)
+{
+    extern void kdbx_dump_nvmes(void);
+
+    kdbx_dump_nvmes();
+
+    return KDB_CPU_MAIN_KDB;
+}
+
+static void kdbx_pr_resources_tree(struct resource *rp, int numsp)
+{
+    for (; rp; rp = rp->sibling) {
+        kdbxp("%*s", numsp, "");   /* print prefix spaces */
+        kdbxp("strt:%lx end:%lx flags:%lx child:%lx name:%s\n",
+              rp->start, rp->end, rp->flags, (ulong)rp->child, rp->name);
+
+        if ( rp->child ) {
+                kdbx_pr_resources_tree(rp->child, numsp+2);
+                kdbxp("\n");
+        }
+    }
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_resources(void)
+{
+    kdbxp("resources: list pci resources (struct resource linux/ioport.h)\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_resources(int argc, const char **argv, struct pt_regs *regs)
+{
+    struct resource *rp;
+
+    rp = &ioport_resource;
+    kdbxp("ioport_resource: %p  (for flags search IORESOURCE_IO)\n",rp);
+    kdbx_pr_resources_tree(rp, 2);
+    kdbxp("\n");
+
+    rp = &iomem_resource;
+    kdbxp("iomem_resource: %p  (for flags search IORESOURCE_IO)\n",rp);
+    kdbx_pr_resources_tree(rp, 2);
+
+    return KDB_CPU_MAIN_KDB;
+}
+
+static int kdbx_walk_pci_bus(struct pci_dev *pdev, void *data)
+{
+    struct pci_driver *pdrvr = pdev->driver;
+
+    kdbxp("pci_device:%p vendor:%h device:%h class:%d\n", pdev, pdev->vendor,
+          pdev->device, pdev->class);
+
+
+    if (pdrvr) {
+        const struct pci_device_id *idt = pdrvr->id_table;
+
+        kdbxp("  pci_driver: name:%s pci_device_id:\n", pdrvr->name);
+        if (idt)
+            kdbxp("    {.vendor=%d .device=%d .subvend:%d .subdevice:%d "
+                  ".class:%d}\n", idt->vendor, idt->device, idt->subvendor,
+                  idt->subdevice, idt->class);
+
+        kdbx_disp_struct_device(&pdev->dev);
+    }
+    return 0;
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_buses(void)
+{
+    kdbxp("buses: list buses\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_buses(int argc, const char **argv, struct pt_regs *regs)
+{
+    struct pci_bus *bus;
+
+    list_for_each_entry(bus, &pci_root_buses, node) {
+        kdbxp("num: %d  parent:%p  name:%s bus devices below: :\n", bus->number,
+              bus->parent, bus->name);
+
+        /* kdbx_disp_struct_device(&bus->dev); nothing in device {} here */
+
+        // pci_walk_bus(bus, kdbx_walk_pci_bus, NULL);<<< Will hang in sem call
+        kdbxp("\n");
+    }
     return KDB_CPU_MAIN_KDB;
 }
 
@@ -5744,6 +6396,216 @@ kdb_cmdf_netvsc(int argc, const char **argv, struct pt_regs *regs)
 }
 #endif /*  __KDBX_SUPPORT_FOR_HYPERV */
 
+
+#ifdef CONFIG_VMIO
+static kdbx_cpu_cmd_t kdb_usgf_vmio(void)
+{
+    kdbxp("vmio [clear]: dump vmio info. clear to clear the stats\n");
+    return KDB_CPU_MAIN_KDB;
+}
+
+static kdbx_cpu_cmd_t 
+kdb_cmdf_vmio(int argc, const char **argv, struct pt_regs *regs)
+{
+    int clear = 0;
+
+    if ( argc > 1 ) {
+        if (strcmp(argv[1], "clear"))
+            return kdb_usgf_vmio();
+        else
+            clear = 1;
+    }
+
+    if (hypervisor_is_type(X86_HYPER_KVM)) {
+        if ( clear ) {
+            kdbx_vmio_clear_guest_stats();  /* drivers/vmio/vmio-guest.c */
+        } else
+            kdbx_dump_guest_vmio();         /* drivers/vmio/vmio-guest.c */
+    } else if (hypervisor_is_type(X86_HYPER_NATIVE)) {
+        if ( clear ) {
+            kdbx_vmio_clear_host_stats();   /* drivers/vmio/vmio-host.c */
+        } else
+            kdbx_dump_host_vmio();          /* drivers/vmio/vmio-host.c */
+    } else
+        kdbxp("Unkonws hypervisor/baremetal mode\n");
+
+    return KDB_CPU_MAIN_KDB;
+}
+
+static void kdbx_display_struct_vreq(struct vmio_req *vreq, uint idx)
+{
+    int i;
+    struct vmio_req_iovecs *iov = vreq ? vreq->v_inreq_iovecs : NULL;
+
+    if (vreq == NULL)
+        return;
+
+    kdbxp("vmio vreq:%p ($%u)  n_next:%x  state:$%d errno: $%d\n",
+          vreq, idx, vreq->v_next, vreq->v_req_state, vreq->v_req_errno);
+    kdbxp("  type:%d  flags:%d  hipri:%d\n", vreq->v_req_type,
+          vreq->v_req_flags, vreq->v_req_hipri);
+    // kdbxp("  v_gprivate: %lx   v_hprivate: %lx\n", vreq->v_gprivate,
+    kdbxp("  v_gprivate:%lx  v_ridx:%x($%d)  v_filler1:%x  v_filler2:%lx\n",
+          vreq->v_gprivate, vreq->v_ridx, vreq->v_ridx, vreq->v_filler1,
+          vreq->v_filler2);
+    kdbxp("  devidx:$%d  flags:%x  starting_sector:%u(%x) bytes:%x/$%u\n", 
+          vreq->v_device_index, vreq->v_req_flags,
+          vreq->v_starting_sector, vreq->v_starting_sector,
+          vreq->v_num_bytes, vreq->v_num_bytes);
+    kdbxp("  numiovecs: $%d  iovecs:%p\n", vreq->v_num_iovecs, iov);
+
+    for (i=0; i < vreq->v_num_iovecs; i++, iov++) {
+        if (i == VMIO_INREQ_IOVECS) {
+                kdbxp("  spill pfn: %lx\n", vreq->v_iovec_gfna[0]);
+                if ( !kdbx_in_kvm_guest ) {
+                        kdbxp("FIXME host. need p2m\n");
+                        return;
+                }
+                iov = pfn_to_kaddr(vreq->v_iovec_gfna[0]);
+        }
+        if (i == VMIO_INREQ_IOVECS+VMIO_IOVECS_PER_PAGE) {
+                kdbxp("  spill pfn: %lx\n", vreq->v_iovec_gfna[1]);
+                iov = pfn_to_kaddr(vreq->v_iovec_gfna[1]);
+        }
+        kdbxp("    [%d]gfn:%lx  len:%x/$%d  offs:$%d\n", i, iov->v_iov_gfn,
+              iov->v_iov_len, iov->v_iov_len, iov->v_iov_offset);
+    }
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_vreq(void)
+{
+    kdbxp("vreq idx(HEX)|ptr: dump vmio_req struct\n");
+    return KDB_CPU_MAIN_KDB;
+}
+
+static kdbx_cpu_cmd_t 
+kdb_cmdf_vreq(int argc, const char **argv, struct pt_regs *regs)
+{
+    uint idx, maxidx;
+    ulong ptridx;
+    struct vmio_req *vreq, *reqa;
+
+    if (argc <= 1 || !kdb_str2ulong(argv[1], &ptridx) ) {
+        return kdb_usgf_vreq();
+    }
+
+    if (hypervisor_is_type(X86_HYPER_KVM))
+        reqa = kdbx_vmio_reqa_guest(&maxidx);
+    else 
+        reqa = kdbx_vmio_reqa_host(&maxidx);
+
+    if (reqa == NULL) {
+        kdbxp("reqa was not found\n");
+        return KDB_CPU_MAIN_KDB;
+    }
+
+    if (ptridx < 0xff00000000000000UL) {
+        /* it's not a ptr. idx is in decimal
+         * if (!kdb_str2decil(argv[1], &ptridx) || ptridx > maxidx) { */
+        if (ptridx > maxidx) {
+            kdbxp("%s is not a valid idx: %lx\n", argv[1], ptridx);
+            return kdb_usgf_vreq();
+        }
+        vreq = reqa + ptridx;
+        idx = ptridx;
+    } else {
+        vreq = (struct vmio_req *)ptridx;
+        if (vreq < reqa || vreq > reqa + maxidx) {
+            kdbxp("vreq %p is not a valid ptr\n", vreq);
+            return kdb_usgf_vreq();
+        }
+        idx = vreq - reqa;
+    }
+    kdbx_display_struct_vreq(vreq, idx);
+    return KDB_CPU_MAIN_KDB;
+}
+
+static void kdbx_walk_vreqlist(uint idx, uint maxidx, struct vmio_req *reqa)
+{
+    int count, state[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    struct vmio_req *vreq = reqa + idx;
+
+    for (count=1; count < maxidx+2; count++) {
+        if (vreq->v_next == -1)
+                break;
+        if (vreq->v_next > maxidx) {
+                kdbxp("corrupt. invalid next: %d\n", vreq->v_next);
+                break;
+        }
+        state[vreq->v_req_state]++;
+        vreq = reqa + vreq->v_next;
+    }
+    if ( count > maxidx + 1) {
+        kdbxp("list corrupted. count:%d. lastvreq:%p\n", count, vreq);
+    }
+    kdbxp("total:%d  [0]:%d [1]:%d [2]:%d [3]:%d [4]:%d\n", count,
+          state[0], state[1], state[2], state[3], state[4]);
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_vreqw(void)
+{
+    kdbxp("vreq idx: walk vreq list given the head idx\n");
+    return KDB_CPU_MAIN_KDB;
+}
+
+static kdbx_cpu_cmd_t 
+kdb_cmdf_vreqw(int argc, const char **argv, struct pt_regs *regs)
+{
+    ulong idx; 
+    uint maxidx;
+    struct vmio_req *reqa;
+
+    if (argc <= 1 || !kdb_str2ulong(argv[1], &idx) ) {
+        return kdb_usgf_vreqw();
+    }
+    if (hypervisor_is_type(X86_HYPER_KVM))
+        reqa = kdbx_vmio_reqa_guest(&maxidx);
+    else 
+        reqa = kdbx_vmio_reqa_host(&maxidx);
+
+    if (reqa == NULL) {
+        kdbxp("reqa was not found\n");
+        return KDB_CPU_MAIN_KDB;
+    }
+    if (idx > maxidx) {
+        kdbxp("invalid idx: %x\n", idx);
+        return kdb_usgf_vreq();
+    }
+
+    kdbx_walk_vreqlist((uint)idx, maxidx, reqa);
+    return KDB_CPU_MAIN_KDB;
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_fsdata(void)
+{
+    kdbxp("fsdata [0xidx|ptr]: walk vreq list given the head idx\n");
+    return KDB_CPU_MAIN_KDB;
+}
+
+static kdbx_cpu_cmd_t 
+kdb_cmdf_fsdata(int argc, const char **argv, struct pt_regs *regs)
+{
+    ulong ptridx;       /* either ptr or an index */
+
+    if (argc > 1 && !kdb_str2ulong(argv[1], &ptridx) ) {
+        return kdb_usgf_fsdata();
+    } else
+        ptridx = ~0;
+
+    if (ptridx < 0xff00000000000000UL && ptridx > VMIO_MAX_FSDATA) {
+        kdbxp("arg seems invalid: %x\n", ptridx);
+        return kdb_usgf_fsdata();
+    }
+
+    if (hypervisor_is_type(X86_HYPER_KVM))
+        kdbx_vmio_dump_fsdata(ptridx);
+    else
+        kdbxp("no fsdata on the host\n");
+
+    return KDB_CPU_MAIN_KDB;
+}
+#endif  /* CONFIG_VMIO */
+
 /* stub to quickly and easily add a new command */
 static kdbx_cpu_cmd_t kdb_usgf_usr1(void)
 {
@@ -5754,9 +6616,6 @@ static kdbx_cpu_cmd_t kdb_usgf_usr1(void)
 static kdbx_cpu_cmd_t
 kdb_cmdf_usr1(int argc, const char **argv, struct pt_regs *regs)
 {
-    ulong *p = (ulong *)0xDEAD;
-
-    mukchk(*p);
     return KDB_CPU_MAIN_KDB;
 }
 
@@ -5895,6 +6754,8 @@ void __init kdbx_init_cmdtab(void)
     {"cur",  kdb_cmdf_cur, kdb_usgf_cur, 1, KDBX_REPEAT_NONE},
 
     {"f",  kdb_cmdf_f,  kdb_usgf_f,  1, KDBX_REPEAT_NONE},
+    {"fk",  kdb_cmdf_fk,  kdb_usgf_fk,  1, KDBX_REPEAT_NONE},
+    {"fsp",  kdb_cmdf_fsp,  kdb_usgf_fsp,  1, KDBX_REPEAT_NONE},
 
     {"dw",  kdb_cmdf_dw,  kdb_usgf_dw,  1, KDBX_REPEAT_NO_ARGS},
     {"dd",  kdb_cmdf_dd,  kdb_usgf_dd,  1, KDBX_REPEAT_NO_ARGS},
@@ -5928,17 +6789,23 @@ void __init kdbx_init_cmdtab(void)
 
     {"tl", kdb_cmdf_tl, kdb_usgf_tl, 1, KDBX_REPEAT_NONE},
     {"ts", kdb_cmdf_ts, kdb_usgf_ts, 1, KDBX_REPEAT_NONE},
+    {"mm", kdb_cmdf_mm, kdb_usgf_mm, 1, KDBX_REPEAT_NONE},
     {"sched", kdb_cmdf_sched, kdb_usgf_sched, 1, KDBX_REPEAT_NONE},
     {"runq", kdb_cmdf_runq, kdb_usgf_runq, 1, KDBX_REPEAT_NONE},
     {"iommu", kdb_cmdf_iommu,   kdb_usgf_iommu,   1, KDBX_REPEAT_NONE},
     {"dmsr",  kdb_cmdf_dmsr,  kdb_usgf_dmsr, 1, KDBX_REPEAT_NONE},
     {"cpuid",  kdb_cmdf_cpuid,  kdb_usgf_cpuid, 1, KDBX_REPEAT_NONE},
 
+    {"us2jiffs", kdb_cmdf_us2jiffs,  kdb_usgf_us2jiffs, 1, KDBX_REPEAT_NONE},
     {"trq", kdb_cmdf_trq,  kdb_usgf_trq, 1, KDBX_REPEAT_NONE},
     {"dgdt", kdb_cmdf_dgdt,  kdb_usgf_dgdt, 1, KDBX_REPEAT_NONE},
     {"didt", kdb_cmdf_didt,  kdb_usgf_didt, 1, KDBX_REPEAT_NONE},
     {"apic", kdb_cmdf_apic,  kdb_usgf_apic, 1, KDBX_REPEAT_NONE},
     {"dirq", kdb_cmdf_dirq,  kdb_usgf_dirq, 1, KDBX_REPEAT_NONE},
+
+    /* mmu related */
+    {"pa", kdb_cmdf_pa,  kdb_usgf_pa, 1, KDBX_REPEAT_NONE},
+    {"va", kdb_cmdf_va,  kdb_usgf_va, 1, KDBX_REPEAT_NONE},
     {"dpage", kdb_cmdf_dpage,  kdb_usgf_dpage, 1, KDBX_REPEAT_NONE},
 
     /* general kernel data structures */
@@ -5946,10 +6813,18 @@ void __init kdbx_init_cmdtab(void)
 
     /* block device, file system, char device, ... */
     {"bio", kdb_cmdf_bio,  kdb_usgf_bio, 1, KDBX_REPEAT_NONE},
-    {"req", kdb_cmdf_req,  kdb_usgf_req, 1, KDBX_REPEAT_NONE},
+    {"request", kdb_cmdf_request,  kdb_usgf_request, 1, KDBX_REPEAT_NONE},
     {"reqq", kdb_cmdf_reqq,  kdb_usgf_reqq, 1, KDBX_REPEAT_NONE},
+    {"gendisk", kdb_cmdf_gendisk,  kdb_usgf_gendisk, 1, KDBX_REPEAT_NONE},
     {"disks", kdb_cmdf_disks,  kdb_usgf_disks, 1, KDBX_REPEAT_NONE},
+    {"blkdev", kdb_cmdf_blkdev,  kdb_usgf_blkdev, 1, KDBX_REPEAT_NONE},
     {"blkdevs", kdb_cmdf_blkdevs,  kdb_usgf_blkdevs, 1, KDBX_REPEAT_NONE},
+    {"nvmes", kdb_cmdf_nvmes,  kdb_usgf_nvmes, 1, KDBX_REPEAT_NONE},
+    {"tagset", kdb_cmdf_tagset,  kdb_usgf_tagset, 1, KDBX_REPEAT_NONE},
+
+    /* pci related */
+    {"resources", kdb_cmdf_resources,  kdb_usgf_resources, 1, KDBX_REPEAT_NONE},
+    {"buses", kdb_cmdf_buses,  kdb_usgf_buses, 1, KDBX_REPEAT_NONE},
 
     /* network related */
     {"netdevs", kdb_cmdf_netdevs,  kdb_usgf_netdevs, 1, KDBX_REPEAT_NONE},
@@ -5980,13 +6855,20 @@ void __init kdbx_init_cmdtab(void)
     {"vbusdevs", kdb_cmdf_vbusdevs,  kdb_usgf_vbusdevs, 1, KDBX_REPEAT_NONE},
     {"vhostdevs", kdb_cmdf_vhostdevs,  kdb_usgf_vhostdevs, 1, KDBX_REPEAT_NONE},
 
+#ifdef CONFIG_VMIO
+    /* vmio related */
+    {"vmio", kdb_cmdf_vmio,  kdb_usgf_vmio, 1, KDBX_REPEAT_NONE},
+    {"vreq", kdb_cmdf_vreq,  kdb_usgf_vreq, 1, KDBX_REPEAT_NONE},
+    {"vreqw", kdb_cmdf_vreqw,  kdb_usgf_vreqw, 1, KDBX_REPEAT_NONE},
+    {"fsdata", kdb_cmdf_fsdata,  kdb_usgf_fsdata, 1, KDBX_REPEAT_NONE},
+#endif   /* CONFIG_VMIO */
+
 #ifdef __KDBX_SUPPORT_FOR_HYPERV
     /* Hyper-V related */
     {"netvsc", kdb_cmdf_netvsc,  kdb_usgf_netvsc, 1, KDBX_REPEAT_NONE},
     {"vmbusc", kdb_cmdf_vmbusc,  kdb_usgf_vmbusc, 1, KDBX_REPEAT_NONE},
 #endif
 
-    /* tracing: avail in crashed state if kdbx itself traced */
     {"trcon", kdb_cmdf_trcon,  kdb_usgf_trcon,  1, KDBX_REPEAT_NONE},
     {"trcoff",kdb_cmdf_trcoff, kdb_usgf_trcoff, 1, KDBX_REPEAT_NONE},
     {"trcz",  kdb_cmdf_trcz,   kdb_usgf_trcz,   0, KDBX_REPEAT_NONE},
