@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009, 2019 Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009, 2020 Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -153,12 +153,12 @@ kdb_expand_el5_sym(struct gst_syminfo *gp, unsigned int off, char *result)
     while(len) {
         u16 u16idx, *u16p;
         if (kdbx_read_mem((kdbva_t)datap, (kdbbyt_t *)&u8idx, 1, vp) != 1) {
-            kdbxp("memory (u8idx) read error:%p\n",gp->tokidxtbl);
+            kdbxp("memory (u8idx) read error:%px\n",gp->tokidxtbl);
             return 0;
         }
         u16p = u8idx + gp->tokidxtbl;
         if (kdbx_read_mem((kdbva_t)u16p, (kdbbyt_t *)&u16idx, 2, vp) != 2) {
-            kdbxp("tokidxtbl read error:%p\n", u16p);
+            kdbxp("tokidxtbl read error:%px\n", u16p);
             return 0;
         }
         tptr = gp->toktbl + u16idx;
@@ -192,11 +192,11 @@ kdb_expand_el4_sym(struct gst_syminfo *gp, int low, char *result, char *symp)
     pid_t gpid = gp->gpid;
     struct kvm_vcpu *vp = gp->vp;
 
-    KDBGP1("Eel4sym:nmp:%p maxidx:$%d sym:%s\n", nmp, low, symp);
+    KDBGP1("Eel4sym:nmp:%px maxidx:$%d sym:%s\n", nmp, low, symp);
     for (i=0; i <= low; i++) {
         /* unsigned prefix = *name++; */
         if (kdbx_read_mem((kdbva_t)nmp, &prefix, 1, vp) != 1) {
-            kdbxp("failed to read:%p gpid:%x\n", nmp, gpid);
+            kdbxp("failed to read:%px gpid:%x\n", nmp, gpid);
             return 0;
         }
         KDBGP2("el4:i:%d prefix:%x\n", i, prefix);
@@ -205,7 +205,7 @@ kdb_expand_el4_sym(struct gst_syminfo *gp, int low, char *result, char *symp)
         addr = (long)result + prefix;
         for (j=0; j < EL4_NMLEN-prefix; j++) {
             if (kdbx_read_mem((kdbva_t)nmp, &byte, 1, vp) != 1) {
-                kdbxp("failed read:%p gpid:%x\n", nmp, gpid);
+                kdbxp("failed read:%px gpid:%x\n", nmp, gpid);
                 return 0;
             }
             KDBGP2("el4:j:%d byte:%x\n", j, byte);
@@ -237,7 +237,7 @@ static uint kdb_get_el5_symoffset(struct gst_syminfo *gp, long pos)
     namep = gp->kallsyms_names;
     for (i=0; i < pos; i++) {
         if (kdbx_read_mem((kdbva_t)namep, &data, 1, vp) != 1) {
-            kdbxp("Can't read gpid:$%d mem:%p\n", gpid, namep);
+            kdbxp("Can't read gpid:$%d mem:%px\n", gpid, namep);
             return 0;
         }
         namep = namep + data + 1;
@@ -261,12 +261,12 @@ static int kdbx_first_aliased_sym(struct gst_syminfo *gp, ulong *lowp)
         }
         addr = (ulong) (gp->u.s1.kallsyms_sizes + low-1);  /* already ulong * */
         if (kdbx_read_mem(addr, (kdbbyt_t *)&val1, sz, vp) != 1) {
-            kdbxp("Can't read gpid:$%d mem:%p\n", gpid, addr);
+            kdbxp("Can't read gpid:$%d mem:%px\n", gpid, addr);
             return -EINVAL;
         }
         addr = (ulong) (gp->u.s1.kallsyms_sizes + low);  /* already ulong * */
         if (kdbx_read_mem(addr, (kdbbyt_t *)&val2, sz, vp) != 1) {
-            kdbxp("Can't read gpid:$%d mem:%p\n", gpid, addr);
+            kdbxp("Can't read gpid:$%d mem:%px\n", gpid, addr);
             return -EINVAL;
         }
         if ( val1 != val2 )
@@ -361,7 +361,7 @@ void kdbx_sav_guest_syminfo(pid_t gpid, ulong namesp, ulong nump, ulong addrap,
     gp->toktbl = (u8 *)toktblp;
     gp->tokidxtbl = (u16 *)tokidxp;
 
-    KDBGP("gpid:%d bitness:$%d namep:%p nump:%lx addr:%p sizes:%lx\n",
+    KDBGP("gpid:%d bitness:$%d namep:%px nump:%lx addr:%px sizes:%lx\n",
           gpid, gp->bitness, gp->kallsyms_names, nump, gp->u.addrtblp,
           gp->u.s1.kallsyms_sizes);
     KDBGP("  relbval:%lx offs:%lx\n", gp->u.s1.relbasea, gp->u.s1.offsetsa); 

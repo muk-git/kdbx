@@ -9,6 +9,8 @@
 #define KDBX_TRAP_NONFATAL  2    /* can resume from kdb */
 #define KDBX_TRAP_KDBSTACK  3    /* to debug kdb itself. dump kdb stack */
 
+#define kdbx_ccpu (raw_smp_processor_id())
+
 struct kvm_vcpu;
 struct vhost_dev;
 
@@ -36,7 +38,6 @@ void kdbx_do_nmi(struct pt_regs *regs);
 void kdbx_dump_uart(void);
 void kdbx_show_stack(struct pt_regs *regs, pid_t pid, int kstack, int max);
 void kdbx_print_regs(struct pt_regs *regs);
-int kdbx_kernel_printk(char *fmt, va_list args);
 void kdbx_sav_vhost_dev(struct vhost_dev *dev, char *type);
 char *kdbx_addr2sym(pid_t, ulong, char *, int);
 ulong kdbx_rsp(void);

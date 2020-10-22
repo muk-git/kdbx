@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009, 2019 Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009, 2020 Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -250,7 +250,7 @@ void kdbx_install_watchpoints(void)
 
             vp->arch.guest_context.debugreg[6] = 0;
             vp->arch.guest_context.debugreg[7] = dr7;
-            KDBGP("kdb_install_watchpoints(): v:%p dr7:%lx\n", vp, dr7);
+            KDBGP("kdb_install_watchpoints(): v:%px dr7:%lx\n", vp, dr7);
             /* hvm_set_info_guest(vp);: Can't because can't vmcs_enter in kdb */
         }
     }

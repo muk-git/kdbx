@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009, Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009 2020 Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -91,7 +91,7 @@ extern volatile int kdbdbg;
 
 #define ASSERT(x) {                                                     \
     if (!(x)) {                                                         \
-        kdbxp("[%d]ASSERT %s FAILED: %s:%d\n", smp_processor_id(), #x,  \
+        kdbxp("[%d]ASSERT %s FAILED: %s:%d\n", raw_smp_processor_id(), #x,  \
               __func__,__LINE__);                                       \
     }                                                                   \
 }

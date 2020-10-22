@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009, Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009, 2020 Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -52,7 +52,9 @@
 #include <linux/interrupt.h>
 #include <linux/pagemap.h>
 #include <linux/jiffies.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
 #include <linux/bootmem.h>
+#endif
 #include <linux/memblock.h>
 #include <linux/compiler.h>
 #include <linux/kernel.h>
@@ -112,9 +114,11 @@
 #include "../arch/x86/kvm/lapic.h"
 #include "../block/blk-mq.h"
 #include "../block/blk-mq-tag.h"
+#include "../block/blk-wbt.h"
 
 #ifdef CONFIG_VMIO
 #include "../drivers/vmio/vmio.h"
+#include "../drivers/vmio/vmio-asmlib-pub.h"
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)

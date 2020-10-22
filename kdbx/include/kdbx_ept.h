@@ -78,4 +78,6 @@ struct ept_data {
 #define EPT_EMT_WB              6
 #define EPT_EMT_RSV2            7
 
+extern int get_ept_level(struct kvm_vcpu *vcpu);
+
 #endif

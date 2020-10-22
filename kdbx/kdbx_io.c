@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009, 2019 Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009, 2020 Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -82,7 +82,7 @@ static int kdbx_tty_open(struct tty_struct *tty, struct file *filp)
     filp->f_flags |= O_NONBLOCK;    /* don't ever let it block */
     rc = tty_port_open(tty->port, tty, filp);
     if ( rc ) {
-        kdbxp("kdbx: failed to open tty port:%p\n", tty->port);
+        kdbxp("kdbx: failed to open tty port:%px\n", tty->port);
         return rc;
     }
     return 0;
@@ -276,17 +276,6 @@ void kdbx_dump_uart(void)
           inb(kdbx_serial_base + REG_ISR), inb(kdbx_serial_base + REG_LSR),
           inb(kdbx_serial_base + REG_MSR), inb(kdbx_serial_base + REG_MCR)); 
 }
-
-#if 0
-void muktrcuart(uint trcid)
-{
-    kdbxtrc(trcid, 0, inb(kdbx_serial_base + REG_IER),
-            inb(kdbx_serial_base + REG_LCR), inb(kdbx_serial_base + REG_ISR));
-    kdbxtrc(trcid+1, 0, inb(kdbx_serial_base + REG_LSR),
-            inb(kdbx_serial_base + REG_MSR), inb(kdbx_serial_base + REG_MCR));
-}
-#endif  /* #if 0 */
-
 
 /* parse the cmd line for ttyS port/index, baud rate etc.. */
 static noinline int kdbx_parse_cmdline(char *cmdline)
@@ -731,8 +720,8 @@ void kdbx_switch_to_tty(void)
         printk(KERN_EMERG "kdbx: unable to find polling driver \n");
         return;
     }
-    kdbxp(">> kdbx: switch to tty driver:%p\n", kdbx_tty_driver);
-    pr_notice(">>>>>>kdbx: switch to tty driver:%p\n", kdbx_tty_driver);
+    kdbxp(">> kdbx: switch to tty driver:%px\n", kdbx_tty_driver);
+    pr_notice(">>>>>>kdbx: switch to tty driver:%px\n", kdbx_tty_driver);
 }
 
 static char tty_kdbx_getc(void)

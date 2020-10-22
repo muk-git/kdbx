@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009, 2019 Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009, 2020 Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -38,7 +38,7 @@ int kdbx_read_mmem(kdbma_t maddr, kdbbyt_t *dbuf, int len)
         va = va + (maddr & (PAGE_SIZE-1));        /* add page offset */
         memcpy(dbuf, (void *)va, pagecnt);
 
-        KDBGP1("maddr:%x va:%p len:%x pagecnt:%x\n", maddr, va, len, pagecnt );
+        KDBGP1("maddr:%x va:%px len:%x pagecnt:%x\n", maddr, va, len, pagecnt);
 
         len = len  - pagecnt;
         maddr += pagecnt;
@@ -71,15 +71,15 @@ static ulong kdb_lookup_pt_entry(ulong gfn, int idx, struct kvm_vcpu *vp)
 
     va = pg ? page_to_virt(pg):NULL;  /* don't kmap(), it calls _cond_resched */
 
-    KDBGP1("lookup e: gfn:%lx pfn:%lx idx:%x va:%p\n", gfn, pfn, idx, va);
+    KDBGP1("lookup e: gfn:%lx pfn:%lx idx:%x va:%px\n", gfn, pfn, idx, va);
     if ( !pfn_valid(pfn) ) {
-        kdbxp("kdb_lookup_pt_entry: pfn:%lx invalid. gfn:%lx vp:%p\n", pfn,
+        kdbxp("kdb_lookup_pt_entry: pfn:%lx invalid. gfn:%lx vp:%px\n", pfn,
               gfn, vp);
         return 0;
     }
 
     if ( pg == NULL || va == NULL ) {
-        kdbxp("lookup: Unable to map pfn: %lx pg:%p\n", pfn, pg);
+        kdbxp("lookup: Unable to map pfn: %lx pg:%px\n", pfn, pg);
         return 0;
     }
 
@@ -99,10 +99,10 @@ static ulong kdb_pt_pfn(ulong addr, ulong cr3gfn, struct kvm_vcpu *vp,
 
     *levelp = PG_LEVEL_NONE;
 
-    KDBGP1("ptepfn: addr:%lx cr3gfn:%lx vp:%p\n", addr, cr3gfn, vp);
+    KDBGP1("ptepfn: addr:%lx cr3gfn:%lx vp:%px\n", addr, cr3gfn, vp);
     entry = kdb_lookup_pt_entry(cr3gfn, pgd_index(addr), vp);
     if ( entry == 0 ) {
-        kdbxp("pgd not present. cr3gfn:%lx pgdidx:%x vp:%p\n",
+        kdbxp("pgd not present. cr3gfn:%lx pgdidx:%x vp:%px\n",
               cr3gfn, pgd_index(addr), vp);
 
         return (ulong)-1;
@@ -168,7 +168,7 @@ static int kdb_rw_cr3_mem(kdbva_t addr, kdbbyt_t *buf, int len,
         return 0;
     }
 
-    KDBGP1("rw-cr3mem: addr:%lx vp:%p len:%d to:%d cr3gfn:%lx\n", addr, vp, 
+    KDBGP1("rw-cr3mem: addr:%lx vp:%px len:%d to:%d cr3gfn:%lx\n", addr, vp, 
            len, toaddr, cr3gfn);
 
     while (len > 0) {
@@ -210,7 +210,7 @@ static int kdb_rw_cr3_mem(kdbva_t addr, kdbbyt_t *buf, int len,
         else
             memcpy(buf, va, pagecnt);
 
-        KDBGP1("addr:%lx va:%p len:%x pagecnt:%x\n", addr, va, len, pagecnt );
+        KDBGP1("addr:%lx va:%px len:%x pagecnt:%x\n", addr, va, len, pagecnt );
 
         len = len  - pagecnt;
         addr += pagecnt;
@@ -228,7 +228,7 @@ static int kdb_rw_cr3_mem(kdbva_t addr, kdbbyt_t *buf, int len,
 int kdbx_read_mem(kdbva_t saddr, kdbbyt_t *dbuf, int len, struct kvm_vcpu *vp)
 {
     long ret;
-    KDBGP2("read mem: saddr:%lx (int)src:%x len:%d vp:%p\n", saddr,
+    KDBGP2("read mem: saddr:%lx (int)src:%x len:%d vp:%px\n", saddr,
            *(uint *)dbuf, len, vp);
 
     if ( max_pfn_mapped == 0 )
@@ -267,7 +267,7 @@ int kdbx_write_mem(kdbva_t daddr, kdbbyt_t *sbuf, int len, struct kvm_vcpu *vp)
 {
     ulong rc;
 
-    KDBGP2("write mem: addr:%lx (int)src:%lx len:%d vp:%p\n", daddr,
+    KDBGP2("write mem: addr:%lx (int)src:%lx len:%d vp:%px\n", daddr,
            *(uint *)sbuf, len, vp);
 
     /* if we are early during boot before init_mem_mapping() */
@@ -330,19 +330,21 @@ static int kdbx_wpt_2M_page(ulong entry, ulong addr)
 
 /* see also: fault.c:dump_pagetable() and pageattr.c:lookup_address()
  * RETURN: 0 on succes. -error if error */
-int kdbx_walk_pt(ulong addr, struct kvm_vcpu *vp)
+int kdbx_walk_pt(ulong addr, ulong cr3gfn, struct kvm_vcpu *vp)
 {
     char buf[32];
     int offs, idx;
-    ulong pa, cr3gfn, gfn, entry;   /* gfn is pfn/mfn if host */
+    ulong pa, gfn, entry;   /* gfn is pfn/mfn if host */
 
-    if ( vp )
-        cr3gfn = kdbx_get_hvm_field(vp, GUEST_CR3) >> PAGE_SHIFT;
-    else
-        cr3gfn = (__pa(init_mm.pgd)) >> PAGE_SHIFT;
+    if (cr3gfn == 0) {
+        if ( vp )
+            cr3gfn = kdbx_get_hvm_field(vp, GUEST_CR3) >> PAGE_SHIFT;
+        else
+            cr3gfn = (__pa(init_mm.pgd)) >> PAGE_SHIFT;
+    }
 
     if ( cr3gfn <= 0 || !pfn_valid(cr3gfn) ) {
-        kdbxp("cr3gfn is invalid:%lx vp:%p\n", cr3gfn, vp);
+        kdbxp("cr3gfn is invalid:%lx vp:%px\n", cr3gfn, vp);
         return -EINVAL;
     }
 

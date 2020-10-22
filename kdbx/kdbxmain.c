@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009, 2019 Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009, 2020 Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -45,7 +45,7 @@ void kdbgtrc(uint trcid, uint int_d0, uint64_t d1_64, uint64_t d2_64,
     idx = kdb_fetch_and_add(1, (uint*)&dtrcidx);
     idx = idx % DKDBTRCMAX;
 
-    dtrca[idx].u.s0.cpu_trcid = (smp_processor_id()<<24) | trcid;
+    dtrca[idx].u.s0.cpu_trcid = (kdbx_ccpu <<24) | trcid;
     dtrca[idx].u.s0.d0 = int_d0;
     dtrca[idx].l1 = d1_64;
     dtrca[idx].l2 = d2_64;
@@ -171,7 +171,7 @@ static void kdb_clr_single_step(struct pt_regs *regs)
  */
 static void kdb_hold_this_cpu(struct pt_regs *regs)
 {
-    int ccpu = smp_processor_id();      /* current cpu */
+    int ccpu = kdbx_ccpu;      /* current cpu */
 
     kdbgtrc(0x310, kdbx_cpu_cmd[ccpu], 0, 0, 0);
     if ( kdbx_no_smp_pause_nmi )
@@ -207,12 +207,16 @@ static void kdb_hold_this_cpu(struct pt_regs *regs)
     KDBGP("[%d]Unhold: cmd:%d\n", ccpu, kdbx_cpu_cmd[ccpu]);
 }
 
+#if LINUX_VERSION_CODE > KERNEL_VERSION(5,4,0)
+static DEFINE_PER_CPU(call_single_data_t, kdbx_smp_csd);
+#endif
+
 /* pause other cpus via an IPI. Note, disabled CPUs can't receive IPIs until
  * enabled */
 static void kdb_smp_pause_cpus(void)
 {
     int cpu, wait_count = 0;
-    int ccpu = smp_processor_id();      /* current cpu */
+    int ccpu = kdbx_ccpu;
     struct cpumask cpumask; 
     int loop_max = kdbx_in_kvm_guest ? 3000 : 2000;
     
@@ -223,7 +227,22 @@ static void kdb_smp_pause_cpus(void)
     if ( kdbx_no_smp_pause_nmi ) {
         // ASSERT(irqs_enabled());     /* smp_call_function_many needs this */
         local_irq_enable();
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
+        /* in 5.4, not safe call this from irq */
         smp_call_function_many(&cpumask, kdbx_pause_this_cpu, NULL, 0);
+#else
+        for_each_online_cpu(cpu) {
+            int rc;
+            call_single_data_t *csd = &per_cpu(kdbx_smp_csd, cpu);
+
+            if (cpu == kdbx_ccpu)
+                continue;
+
+            rc=smp_call_function_single_async(cpu, csd);
+            if (rc)
+                kdbxp("kdbx: failed to ipi cpu:%d rc:%d\n", cpu, rc);
+        }
+#endif
     } else {
         kdb_pause_nmi_inprog = 1;
 
@@ -299,7 +318,7 @@ static void kdb_smp_unpause_cpus(int ccpu)
     int wait_count = 0;
     cpumask_t cpumask = *cpu_online_mask;
 
-    cpumask_clear_cpu(smp_processor_id(), &cpumask);
+    cpumask_clear_cpu(kdbx_ccpu, &cpumask);
 
     KDBGP("[%d]kdb_smp_unpause_other_cpus()\n", ccpu);
     for_each_cpu(cpu, &cpumask)
@@ -363,7 +382,6 @@ static noinline int
 kdb_check_dbtrap(kdbx_reason_t *reasp, int ss_mode, struct pt_regs *regs) 
 {
     int rc = 2;
-    int ccpu = smp_processor_id();
 
     /* DB excp caused by hw breakpoint or the TF flag. The TF flag is set
      * by us for ss mode or to install breakpoints. In ss mode, none of the
@@ -371,8 +389,8 @@ kdb_check_dbtrap(kdbx_reason_t *reasp, int ss_mode, struct pt_regs *regs)
      * so we don't do it on a spurious DB trap.
      */
     if (*reasp == KDB_REASON_DBEXCP && !ss_mode) {
-        if (kdbx_cpu_cmd[ccpu] == KDB_CPU_INSTALL_BP) {
-                kdb_end_session(ccpu, regs);
+        if (kdbx_cpu_cmd[kdbx_ccpu] == KDB_CPU_INSTALL_BP) {
+                kdb_end_session(kdbx_ccpu, regs);
                 rc = 1;
             // }
         } else if (! kdbx_check_watchpoints(regs)) {
@@ -428,7 +446,7 @@ kdb_main_entry_misc(kdbx_reason_t reason, struct pt_regs *regs,
  */
 static int kdbxmain(kdbx_reason_t reason, struct pt_regs *regs)
 {
-    int ccpu = smp_processor_id();                /* current cpu */
+    int ccpu = kdbx_ccpu;       /* current cpu */
     int rc = 1, cmd = kdbx_cpu_cmd[ccpu];
     int ss_mode = (cmd == KDB_CPU_SS || cmd == KDB_CPU_NI);
     // int delayed_install = (kdbx_cpu_cmd[ccpu] == KDB_CPU_INSTALL_BP);
@@ -550,7 +568,7 @@ out:
         local_irq_disable();
 
     kdbgtrc(0x21f, rc, kdbx_cpu_cmd[ccpu], kdb_init_cpu, kdbx_session_begun);
-    KDBGP("[%d]kdbxmain:X: rc:%d cmd:%d regs:%p eflg:0x%lx initc:%d sesn:%d " 
+    KDBGP("[%d]kdbxmain:X: rc:%d cmd:%d regs:%px eflg:0x%lx initc:%d sesn:%d " 
           "cs:%x irqs:%d tif:%d\n", ccpu, rc, kdbx_cpu_cmd[ccpu], regs,
           regs->flags, kdb_init_cpu, kdbx_session_begun, regs->cs,
           irqs_enabled(), tif_need_resched());
@@ -561,6 +579,8 @@ out:
 /* IPI -> IDT.call_function_interrupt -> ... -> here
  * VMX: vmexit -> vmx_vcpu_run -> vcpu_enter_guest -> vmx_handle_external_intr
  *      -> call IDT[INTR_INFO_VECTOR_MASK] -> call_function_interrupt -> here
+ *
+ * 5.4.17 onwards: vcpu_enter_guest -> handle_external_interrupt_irqoff
  */
 static void kdbx_pause_this_cpu(void *info)
 {
@@ -635,7 +655,7 @@ int kdbx_keyboard(struct pt_regs *regs)
 int kdbx_handle_trap_entry(int vector, const struct pt_regs *regs1)
 {
     int rc = 0;
-    int ccpu = smp_processor_id();
+    int ccpu = kdbx_ccpu;       /* current cpu */
     struct pt_regs *regs = (struct pt_regs *)regs1; /* stupid const */
 
     KDBGP("[%d]handle_trap: vector:%d IP:%lx\n", ccpu, vector, regs->ip);
@@ -685,8 +705,6 @@ int kdbx_handle_trap_entry(int vector, const struct pt_regs *regs1)
  */
 void kdbx_do_nmi(struct pt_regs *regs)
 {
-    int ccpu = smp_processor_id();
-
     if ( kdb_pause_nmi_inprog ) {
 
         /* it's a pause NMI from kdb main cpu.
@@ -698,7 +716,7 @@ void kdbx_do_nmi(struct pt_regs *regs)
          */
 
         kdbxmain(KDB_REASON_PAUSE_IPI, regs);
-        KDBGP("[%d]kdbx_do_nmi return.\n", ccpu);
+        KDBGP("[%d]kdbx_do_nmi return.\n", kdbx_ccpu);
 
         return;
     }
@@ -737,9 +755,7 @@ int kdbx_handle_guest_trap(int vector, struct kvm_vcpu *vp)
 /* called from kdbxmain_fatal and kdb_cmds-> send nmi to cpu/s */
 void kdbx_nmi_pause_cpus(struct cpumask cpumask)
 {
-    int ccpu = smp_processor_id();
-
-    cpumask_clear_cpu(ccpu, &cpumask);
+    cpumask_clear_cpu(kdbx_ccpu, &cpumask);
     if ( !cpumask_empty(&cpumask) )
         apic->send_IPI_mask_allbutself(&cpumask, NMI_VECTOR);
 }
@@ -747,7 +763,7 @@ void kdbx_nmi_pause_cpus(struct cpumask cpumask)
 DEFINE_SPINLOCK(kdb_nmi_lk);
 void kdbxmain_fatal(struct pt_regs *regs, int vector)
 {
-    int ccpu = smp_processor_id();
+    int ccpu = kdbx_ccpu;       /* current cpu */
 
     if ( vector == X86_TRAP_DF ) {
         if (!spin_trylock(&kdb_nmi_lk)) {
@@ -799,7 +815,7 @@ void kdbxmain_fatal(struct pt_regs *regs, int vector)
 DEFINE_SPINLOCK(kdb_immed_lk);
 void kdbx_trap_immed(int reason)        /* fatal, non-fatal, kdb stack etc... */
 {
-    int ccpu = smp_processor_id();
+    int ccpu = kdbx_ccpu;       /* current cpu */
     int disabled = irqs_disabled();
 
     KDBGP("[%d]trapimm: reas:%d\n", ccpu, reason);
@@ -827,9 +843,9 @@ void kdbx_trap_immed(int reason)        /* fatal, non-fatal, kdb stack etc... */
 static int kdbx_nmi_handler(struct pt_regs *regs, int error_code)
 {
     static int in_nmi[NR_CPUS];
-    int ccpu = smp_processor_id();
+    int ccpu = kdbx_ccpu;       /* current cpu */
 
-    kdbxp("[%d]:kdbx_do_nmi() err:%d\n", smp_processor_id(), error_code);
+    kdbxp("[%d]:kdbx_do_nmi() err:%d\n", ccpu, error_code);
 
     if ( in_nmi[ccpu] ) {
         kdbxp("[%d] spurious nmi:%d\n", ccpu, cmd);
@@ -869,7 +885,11 @@ static void kdbx_init_vmx_extint_info(void)
 {
     ulong sz, offs;
     char buf[KSYM_NAME_LEN+1];
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
     ulong addr = kallsyms_lookup_name("vmx_handle_external_intr");
+#else
+    ulong addr = kallsyms_lookup_name("handle_external_interrupt_irqoff");
+#endif
 
     if ( addr == 0 ) {
         /* pr_notice : so it's in the dmesg */
@@ -902,6 +922,15 @@ static int kdbx_running_in_kvm_vm(void)
 /* called during early boot from arch/x86/kernel/setup.c: setup_arch() */
 void __init kdbx_init(char *boot_command_line)
 {
+#if LINUX_VERSION_CODE > KERNEL_VERSION(5,4,0)
+    int cpu;
+
+    for_each_online_cpu(cpu) {
+        call_single_data_t *csd = &per_cpu(kdbx_smp_csd, cpu);
+        csd->func = kdbx_pause_this_cpu;
+    }
+#endif
+
     kdbx_init_cmdtab();               /* Initialize Command Table */
     kdbx_in_kvm_guest = kdbx_running_in_kvm_vm();
     kdbx_init_io(boot_command_line);
@@ -909,7 +938,7 @@ void __init kdbx_init(char *boot_command_line)
     if (!kdbx_in_kvm_guest)
         kdbx_init_vmx_extint_info();
 
-    printk("kdbx: turned off rcu stall warnings.. rcu_cpu_stall_suppress\n");
+    printk("kdbx: turn off rcu stall warnings.. rcu_cpu_stall_suppress\n");
     rcu_cpu_stall_suppress = 1;
 
     if ( kdbx_in_kvm_guest ) 
@@ -982,7 +1011,7 @@ void kdbxtrc(uint trcid, uint int_d0, uint64_t d1_64, uint64_t d2_64,
     idx = kdb_fetch_and_add(1, (uint*)&trcidx);
     idx = idx % KDBTRCMAX;
 
-    trca[idx].u.s0.cpu_trcid = (smp_processor_id()<<24) | trcid;
+    trca[idx].u.s0.cpu_trcid = (kdbx_ccpu<<24) | trcid;
     trca[idx].u.s0.d0 = int_d0;
     trca[idx].l1 = d1_64;
     trca[idx].l2 = d2_64;
@@ -1046,7 +1075,6 @@ ulong kdbx_tsc_to_ns(ulong delta)
 
         return ns;
 }
-
 ulong kdbx_tsc_to_us(ulong delta)
 {
         return kdbx_tsc_to_ns(delta) / NSEC_PER_USEC;

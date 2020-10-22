@@ -51,6 +51,7 @@ extern struct bus_type *kdbx_ret_virtio_bus_addr(void);
 
 extern void kdbx_dump_guest_vmio(void);
 extern void kdbx_dump_host_vmio(void);
+extern void kdbx_vmioal_dump(void);
 extern void kdbx_vmio_clear_guest_stats(void);
 extern void kdbx_vmio_clear_host_stats(void);
 extern void kdbx_vmio_host_dump_iovecs(struct vmio_req *vreq, int numsp);
@@ -96,7 +97,7 @@ extern kdbva_t kdbx_print_instr(kdbva_t, long, pid_t);
 extern int kdbx_read_mmem(kdbva_t, kdbbyt_t *, int);
 extern int kdbx_read_mem(kdbva_t, kdbbyt_t *, int, struct kvm_vcpu *);
 extern int kdbx_write_mem(kdbva_t, kdbbyt_t *, int, struct kvm_vcpu *);
-extern int kdbx_walk_pt(ulong addr, struct kvm_vcpu *vp);
+extern int kdbx_walk_pt(ulong addr, ulong cr3pfn, struct kvm_vcpu *vp);
 extern int kdbx_is_addr_guest_text(ulong addr, pid_t gpid);
 extern kdbva_t kdbx_guest_sym2addr(char *p, pid_t gpid);
 extern char *kdbx_guest_addr2sym(unsigned long addr, pid_t gpid, ulong *offsp);
