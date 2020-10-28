@@ -1,0 +1,98 @@
+
+Welcome to kdbx. For the brave, it is a non-source level kernel debugger
+for debugging linux kernel, that also extends to KVM hypervisor debug. I
+had originally written it for xen (named kdb), then as I moved on, adapted 
+it to linux kernel (renamed kdbx), and have been adding KVM debug support.
+It is an ongoing project. It works most of the time.
+
+   *.patch: patches for various versions of OL kernels.
+   kdbx: directory that contains the debugger files.
+   fixups: directory for tiny patch for extra compiler flags.
+
+
+Pre-Requisite:
+ o Either physical serial console, or virtual console like from iLOM, or 
+   serial over lan. Get it working first.
+
+
+STEPS:
+ o Version numbers of *.patch files are Oracle Linux version numbers.
+ o Download exact oracle linux src rpm, or find patch nearest to your 
+   version.  Say, Oracle Linux 4.14.35-1902.9.2:
+      patch -p1 < fixups/fixup-4.14.35-1902.2.0.patch
+      patch -p1 < 4.14.35-1902.2.0.patch
+ o Undo whatever you didn't like from the fixup-4.14.35-1902.2.0.patch.
+ o Create kdbx directory in the root of the linux source tree. Do git
+   log and look for "VERSION:" to find different versions and their 
+   closes linux versions. Eg:
+          VERSION: V4
+          Probably OL linux 4.9, 4.14.35
+ o Turn on/off recomended config options. See below.
+ o make kdbx=y all, and copy/install modules and bzImage.
+ o 'ctrl' + '\' (control with backslash) to break into the debugger from a
+   serial console.
+ o Type h for list of commands, see kdbx_cmds.c kdbx_init_cmdtab() for
+   function corresponding to a command to get an idea of what it does.
+ o Use existing commands, add more commands, or to temporarily add something,
+   just modify kdb_cmdf_usr1 and at kdbx prompt type usr1.
+
+
+kdbx/Makefile flags:
+ o KDBX_CONFIG_SWITCH_TO_TTY: 
+     N: talk directly via in/out instructions to the serial port.
+     Y: switch to communicating via the tty driver after its loaded during boot.
+
+
+CONFIG options:
+ o Required:
+       CONFIG_KVM=y
+       CONFIG_KVM_INTEL=y
+       CONFIG_KVM_AMD=y
+       CONFIG_CTF=n
+       CONFIG_DTRACE=n  (if present)
+
+   If debugging a driver, much easier to just build it in. Say vhost-scsi:
+       CONFIG_VHOST_SCSI=y
+
+ o CONFIG_SERIAL_8250: 
+   HOST: just can't get this to work reliably on the baremetal.  So, if 
+         building for baremetal, set CONFIG_SERIAL_8250=n, and kdbx_io.c will 
+         do io in basic uart mode. Seems to work reliably without enabling
+         KDBX_CONFIG_SWITCH_TO_TTY. But if building with CONFIG_SERIAL_8250=y,
+         and it hangs, try enabling KDBX_CONFIG_SWITCH_TO_TTY. 
+
+   KVM VM: While kdbx on host can be used to debug VM also, it is better to 
+           just build the KVM guest with kdbx if it's a linux guest. In
+           that case, kdbx seems to hang often in KVM IPI path, or in the 
+           KVM serial irq path. Following seems to work most of the time:
+               CONFIG_SERIAL_8250=y and KDBX_CONFIG_SWITCH_TO_TTY=y
+
+
+Xen dom0: 
+ o To debug xen dom0, ie, dom0 kernel will have the kdbx debugger in it,
+   apply patch dom0kdbx.diff, and enable CONFIG_KDBX_FOR_XEN_DOM0 in 
+   kdbx/Makefile. Additionally, comment out duplicate functions in kdbx_io.c
+
+Xen:
+ o To debug xen hypervisor: xen/kdb
+ o To debug domUs, see gdbsx in tools directory.
+
+
+FEATURES:
+ o standard commands like set breakpoint, single step, etc..
+ o earlykdbx: to break into the debugger way early during boot to debug
+   problems during boot. 
+ o cmd line editing is limited to backspace only.
+ o Type h, or see kdbx_cmds.c at the bottom for list of commands.
+
+
+NOTE:
+   - since almost all numbers are in hex, 0x is not prefixed. Instead, decimal
+     numbers are preceded by $, as in $17 (sorry, one gets used to it). Note,
+     vcpu num, cpu num, domid are always displayed in decimal, without $.
+   - watchdog must be disabled to use kdb
+
+
+Mukesh Rathor
+todfod at gmail dot com
+
