@@ -101,24 +101,24 @@
 #include <linux/tcp.h>
 #include <linux/virtio_config.h>
 #include <linux/virtio_ids.h>
-#include "../drivers/virtio/virtio_pci_common.h"
+#include "drivers/virtio/virtio_pci_common.h"  /* don't do relative path */
 #include <net/ip.h>
 #include <linux/platform_device.h>
 #include <linux/serial_8250.h>
 #include <asm/serial.h>
 #include <kvm/iodev.h>
 #include <scsi/scsi_host.h>
-#include "../../kernel/sched/sched.h"
-#include "../drivers/tty/serial/8250/8250.h"
-#include "../drivers/vhost/vhost.h"
-#include "../arch/x86/kvm/lapic.h"
-#include "../block/blk-mq.h"
-#include "../block/blk-mq-tag.h"
-#include "../block/blk-wbt.h"
+#include "kernel/sched/sched.h"            /* don't do relative path */
+#include "drivers/tty/serial/8250/8250.h"  /* don't do relative path */
+#include "drivers/vhost/vhost.h"           /* don't do relative path */
+#include "arch/x86/kvm/lapic.h"            /* don't do relative path */
+#include "block/blk-mq.h"                  /* don't do relative path */
+#include "block/blk-mq-tag.h"              /* don't do relative path */
+#include "block/blk-wbt.h"                 /* don't do relative path */
 
 #ifdef CONFIG_VMIO
-#include "../drivers/vmio/vmio.h"
-#include "../drivers/vmio/vmio-asmlib-pub.h"
+#include "drivers/vmio/vmio.h"
+#include "drivers/vmio/vmio-asmlib-pub.h"
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)

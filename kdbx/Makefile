@@ -1,4 +1,9 @@
 
+# Add absolute path here so that kdbxinc.h can do includes of files not in the
+# include directories. This is set to the root directory, ie, one above and not
+# to the current kdbx directory because make is run up there.
+KBUILD_CPPFLAGS +=-I$(CURDIR)
+
 # If buliding for xen dom0, uncomment below and see comment in kdbx_io.c
 ## KBUILD_CPPFLAGS +=-DCONFIG_KDBX_FOR_XEN_DOM0
 
