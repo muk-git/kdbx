@@ -1,18 +1,8 @@
-From 76e2f050b3f342835d2da045192f4c707d72a9d7 Mon Sep 17 00:00:00 2001
-From: Mukesh Rathor <mukesh.rathor@oracle.com>
-Date: Wed, 22 Jul 2020 17:38:47 -0700
-Subject: [PATCH] mukesh: apply fixup
-
----
- .gitignore | 12 ++++++++++++
- Makefile   |  5 +++++
- 2 files changed, 17 insertions(+)
-
 diff --git a/.gitignore b/.gitignore
-index bc9164db98a3..1541fa141d73 100644
+index bc9164db98a3..9c292436a98e 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -9,6 +9,18 @@
+@@ -9,6 +9,17 @@
  #
  # Normal rules (sorted alphabetically)
  #
@@ -20,7 +10,6 @@ index bc9164db98a3..1541fa141d73 100644
 +config-4.14*
 +config-5.4*
 +okvmstat
-+kdbx
 +*.diff
 +*.sav
 +vmioctl
@@ -54,6 +43,3 @@ index 96bf8219a73d..584b931b8950 100644
  KBUILD_LDFLAGS_MODULE += --build-id
  LDFLAGS_vmlinux += --build-id
  
--- 
-2.17.2
-
