@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009, 2020 Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009, 2019 Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -25,20 +25,26 @@ int kdbx_read_mmem(kdbma_t maddr, kdbbyt_t *dbuf, int len)
 {
     ulong orig = len;
 
+    if ((maddr >> PAGE_SHIFT) > max_pfn) {
+        kdbxp("pfn: %lx is larger than max_pfn\n", maddr>>PAGE_SHIFT);
+        return 0;
+    }
+
     while (len > 0) {
         ulong pagecnt = min_t(long, PAGE_SIZE - (maddr & ~PAGE_MASK), len);
         struct page *pg = pfn_to_page(maddr >> PAGE_SHIFT);
         char *va = page_to_virt(pg); /* don't kmap(), it calls _cond_resched */
 
         if ( pg == NULL || va == NULL ) {
-            kdbxp("kdbx: unable to map maddr:%016lx\n", maddr);
+            kdbxp("kdbx: unable to map: %016lx. pg:%p va:%p\n", maddr, pg, va);
             break;
         }
 
         va = va + (maddr & (PAGE_SIZE-1));        /* add page offset */
         memcpy(dbuf, (void *)va, pagecnt);
 
-        KDBGP1("maddr:%x va:%px len:%x pagecnt:%x\n", maddr, va, len, pagecnt);
+        KDBGP1("maddr:%lx va:%p pg:%p len:%x pagecnt:%x\n", maddr, va, pg, len, 
+               pagecnt);
 
         len = len  - pagecnt;
         maddr += pagecnt;
@@ -220,14 +226,12 @@ static int kdb_rw_cr3_mem(kdbva_t addr, kdbbyt_t *buf, int len,
     return orig_len - len;
 }
 
-/* RETURNS: number of bytes written */
 /*
- * copy/read guest memory
+ * copy/read host or guest memory
  * RETURNS: number of bytes copied 
  */
 int kdbx_read_mem(kdbva_t saddr, kdbbyt_t *dbuf, int len, struct kvm_vcpu *vp)
 {
-    long ret;
     KDBGP2("read mem: saddr:%lx (int)src:%x len:%d vp:%px\n", saddr,
            *(uint *)dbuf, len, vp);
 
@@ -236,13 +240,23 @@ int kdbx_read_mem(kdbva_t saddr, kdbbyt_t *dbuf, int len, struct kvm_vcpu *vp)
 
     if ( vp )
         return kdb_rw_cr3_mem(saddr, dbuf, len, vp, 0);
-    else {
+
+    if (saddr < 0xffff800000000000) {             /* is user space address */
+        len -= copy_from_user(dbuf, (void *)saddr, len);
+    } else {
+        /* saddr must be the host va, so just access it directly. In case of
+         * exception, will back to cmd input after printing exception msg and
+         * caller will not be accessing the dbuf */
+        memcpy(dbuf, (void *)saddr, len);
+#if 0
         ret = probe_kernel_read((void *)dbuf, (void *)saddr, len);
         if ( ret ) {
             KDBGP1("probe_kernel failed: saddr:%lx ret:%ld\n", saddr, ret);
             return 0;
         }
+#endif
     }
+    KDBGP("kdbx_read_mem: saddr:%lx ret len:%ld\n", saddr, len);
     return len;
 }
 
@@ -263,6 +277,7 @@ static int kdbx_write_protected(kdbva_t daddr, kdbbyt_t *sbuf, int len )
  * write guest or host memory. if vp, then guest, else host.
  * RETURNS: number of bytes written
  */
+extern bool acpi_permanent_mmap;
 int kdbx_write_mem(kdbva_t daddr, kdbbyt_t *sbuf, int len, struct kvm_vcpu *vp)
 {
     ulong rc;
@@ -270,8 +285,10 @@ int kdbx_write_mem(kdbva_t daddr, kdbbyt_t *sbuf, int len, struct kvm_vcpu *vp)
     KDBGP2("write mem: addr:%lx (int)src:%lx len:%d vp:%px\n", daddr,
            *(uint *)sbuf, len, vp);
 
-    /* if we are early during boot before init_mem_mapping() */
-    if ( max_pfn_mapped == 0 )
+    /* if we are early during boot before init_mem_mapping(). 
+     * nb: if ( max_pfn_mapped == 0 ): can't use this anymore in newer kernels
+     * so, acpi_permanent_mmap appears to be a good global to pick */
+    if (acpi_permanent_mmap == false)
         return kdb_early_wmem(daddr, sbuf, len);
 
     if ( vp == NULL ) {          /* host memory */
@@ -336,14 +353,14 @@ int kdbx_walk_pt(ulong addr, ulong cr3gfn, struct kvm_vcpu *vp)
     int offs, idx;
     ulong pa, gfn, entry;   /* gfn is pfn/mfn if host */
 
+    /* cr3gfn is pfn/mfn if host, ie vp==0 */
     if (cr3gfn == 0) {
         if ( vp )
             cr3gfn = kdbx_get_hvm_field(vp, GUEST_CR3) >> PAGE_SHIFT;
         else
             cr3gfn = (__pa(init_mm.pgd)) >> PAGE_SHIFT;
     }
-
-    if ( cr3gfn <= 0 || !pfn_valid(cr3gfn) ) {
+    if ( !pfn_valid(cr3gfn) ) {
         kdbxp("cr3gfn is invalid:%lx vp:%px\n", cr3gfn, vp);
         return -EINVAL;
     }

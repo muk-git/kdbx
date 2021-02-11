@@ -21,6 +21,7 @@ extern struct list_head vm_list;
 extern struct boot_params boot_params;
 extern struct super_block *blockdev_superblock;
 extern struct class block_class;
+extern unsigned long max_mapnr;
 
 extern int kdbx_in_kvm_guest;
 

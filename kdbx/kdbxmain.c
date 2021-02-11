@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009, 2020 Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009, 2019 Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -972,7 +972,8 @@ static const char *kdb_gettrapname(int trapno)
 
 
 /* ====================== Generic tracing subsystem ======================== */
-/* TIMESTAMP/DELAY : use sched_clock() for timestamps tracing */
+/* TIMESTAMP/DELAY: use sched_clock() for timestamps tracing. 
+ *   For VM, see kdbx_tsc_to_ns below */
 
 #define KDBTRCMAX 4096    /* set this to max number of recs to trace. each rec 
                            * is 32 bytes */
