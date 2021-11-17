@@ -28,7 +28,6 @@ extern int kdbx_in_kvm_guest;
 struct vmcs;
 struct virtio_blk;
 struct virtio_scsi;
-struct vmio_req;
 
 /* kdbx interfaces in linux files */
 #ifdef CONFIG_KDBX_FOR_XEN_DOM0
@@ -49,18 +48,6 @@ extern void kdbx_disp_virtio_scsi(struct virtio_scsi *);
 extern void kdbx_disp_virtq(struct virtqueue *vq);
 extern void kdbx_disp_virtio_blk(struct virtio_blk *);
 extern struct bus_type *kdbx_ret_virtio_bus_addr(void);
-
-extern void kdbx_dump_guest_vmio(void);
-extern void kdbx_dump_host_vmio(void);
-extern void kdbx_vmioal_dump(void);
-extern void kdbx_vmio_clear_guest_stats(void);
-extern void kdbx_vmio_clear_host_stats(void);
-extern void kdbx_vmio_host_dump_iovecs(struct vmio_req *vreq, int numsp);
-extern struct vmio_req *kdbx_vmio_reqa_guest(int *);
-extern struct vmio_req *kdbx_vmio_reqa_host(int *);
-extern void kdbx_vmio_dump_fsdata(ulong ptridx);
-
-
 
 /* linux interfaces used by kdbx */
 extern unsigned long address_lookup(char *);

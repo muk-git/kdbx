@@ -116,11 +116,6 @@
 #include "block/blk-mq-tag.h"              /* don't do relative path */
 #include "block/blk-wbt.h"                 /* don't do relative path */
 
-#ifdef CONFIG_VMIO
-#include "drivers/vmio/vmio.h"
-#include "drivers/vmio/vmio-asmlib-pub.h"
-#endif
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
 #include <asm/text-patching.h>
 #endif
