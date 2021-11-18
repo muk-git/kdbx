@@ -122,7 +122,7 @@ static struct ktermios kdbx_tty_termios = {
     .c_oflag = 0,
     .c_cflag = B115200 | CS8 | CREAD | CLOCAL,
     .c_lflag = 0,
-    .c_cc = 0,        /* what are the control flags */
+    .c_cc = {0},        /* what are the control flags */
 };
 
 /* systemd etc will set termios and set OPOST and other flags and mess it

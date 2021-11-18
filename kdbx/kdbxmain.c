@@ -834,6 +834,7 @@ void kdbx_trap_immed(int reason)        /* fatal, non-fatal, kdb stack etc... */
     if (reason != KDBX_TRAP_KDBSTACK && disabled)
         local_irq_disable();
 }
+EXPORT_SYMBOL(kdbx_trap_immed);
 
 #if 0
 /* cmd: NMI_LOCAL, NMI_UNKNOWN, ... */
@@ -885,22 +886,23 @@ static void kdbx_init_vmx_extint_info(void)
 {
     ulong sz, offs;
     char buf[KSYM_NAME_LEN+1];
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
-    ulong addr = kallsyms_lookup_name("vmx_handle_external_intr");
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,18,0)
+    char *vmx_extirq_exit_f = "vmx_handle_external_intr";
 #else
-    ulong addr = kallsyms_lookup_name("handle_external_interrupt_irqoff");
+    char *vmx_extirq_exit_f = "handle_external_interrupt_irqoff";
 #endif
+    ulong addr = kallsyms_lookup_name(vmx_extirq_exit_f);
 
     if ( addr == 0 ) {
         /* pr_notice : so it's in the dmesg */
         pr_notice(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>KDBX kdbx\n");
-        pr_notice(">> kdbx: vmx_handle_external_intr not found\n");
+        pr_notice(">> kdbx: %s not found\n", vmx_extirq_exit_f);
         return;
     }
 
     if ( kallsyms_lookup(addr, &sz, &offs, NULL, buf) == NULL || sz == 0 ) {
         pr_notice(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>KDBX kdbx\n");
-        pr_notice(">> kdbx: vmx_handle_external_intr addr not found\n");
+        pr_notice(">> kdbx: %s addr not found\n", vmx_extirq_exit_f);
         return;
     }
     vmx_handle_external_intr_s = addr;
@@ -1039,12 +1041,16 @@ void kdbx_trcp(void)
  */
 void kdbx_handle_sysrq_c(int key)
 {
+    // kdbx_print_cstruct("kdbx_testst", NULL);
+    return;
+
     kdbx_trap_immed(KDBX_TRAP_NONFATAL);
 }
 
 void noinline mukchk(unsigned long ul)
 {
 }
+EXPORT_SYMBOL(mukchk);
 
 /* =========== */
 

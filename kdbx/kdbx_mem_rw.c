@@ -32,19 +32,17 @@ int kdbx_read_mmem(kdbma_t maddr, kdbbyt_t *dbuf, int len)
 
     while (len > 0) {
         ulong pagecnt = min_t(long, PAGE_SIZE - (maddr & ~PAGE_MASK), len);
-        struct page *pg = pfn_to_page(maddr >> PAGE_SHIFT);
-        char *va = page_to_virt(pg); /* don't kmap(), it calls _cond_resched */
+        char *va = phys_to_virt(maddr); /* no kmap(), it calls _cond_resched */
 
-        if ( pg == NULL || va == NULL ) {
-            kdbxp("kdbx: unable to map: %016lx. pg:%p va:%p\n", maddr, pg, va);
+        if ( va == NULL ) {
+            kdbxp("kdbx: unable to map: %016lx. va:%px\n", maddr, va);
             break;
         }
 
         va = va + (maddr & (PAGE_SIZE-1));        /* add page offset */
         memcpy(dbuf, (void *)va, pagecnt);
 
-        KDBGP1("maddr:%lx va:%p pg:%p len:%x pagecnt:%x\n", maddr, va, pg, len, 
-               pagecnt);
+        KDBGP1("maddr:%lx va:%px len:%x pagecnt:%x\n", maddr, va, len, pagecnt);
 
         len = len  - pagecnt;
         maddr += pagecnt;

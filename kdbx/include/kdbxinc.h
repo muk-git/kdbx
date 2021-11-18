@@ -52,7 +52,7 @@
 #include <linux/interrupt.h>
 #include <linux/pagemap.h>
 #include <linux/jiffies.h>
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,18,0)
 #include <linux/bootmem.h>
 #endif
 #include <linux/memblock.h>
