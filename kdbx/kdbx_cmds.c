@@ -4803,6 +4803,35 @@ kdb_cmdf_macro(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
+#ifdef KDBX_CONFIG_CSTRUCTS
+static kdbx_cpu_cmd_t kdb_usgf_cst(void)
+{
+    kdbxp("cst cstruct-name addr: print c struct at given addr\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_cst(int argc, const char **argv, struct pt_regs *regs)
+{
+    int mnum;
+    char *addr;
+
+    if (argc < 3) 
+        return kdb_usgf_cst();
+
+    if (!kdb_str2addr(argv[2], (kdbva_t *)&addr, 0)) {
+        kdbxp("cst: Invalid addr/sym: %s\n", argv[1]);
+        return KDB_CPU_MAIN_KDB;
+    }
+    if (!virt_addr_valid(addr)) {
+        kdbxp("cst: virt addr %px is invalid\n", addr);
+        return KDB_CPU_MAIN_KDB;
+    }
+
+    kdbx_print_cstruct((char *)argv[1], addr);
+    return KDB_CPU_MAIN_KDB;
+}
+#endif /* KDBX_CONFIG_CSTRUCTS */
+
 /* Save symbols info for a guest */
 static kdbx_cpu_cmd_t kdb_usgf_sym(void)
 {
@@ -7285,6 +7314,11 @@ void __init kdbx_init_cmdtab(void)
     {"sym2addr",  kdb_cmdf_sym2addr, kdb_usgf_sym2addr, 1, KDBX_REPEAT_NONE},
     {"wq", kdb_cmdf_wq,  kdb_usgf_wq, 1, KDBX_REPEAT_NONE},
     {"macro", kdb_cmdf_macro,  kdb_usgf_macro, 1, KDBX_REPEAT_NONE},
+
+#ifdef KDBX_CONFIG_CSTRUCTS
+    /* print c struct compiled in via a large text file */
+    {"cst", kdb_cmdf_cst,  kdb_usgf_cst, 1, KDBX_REPEAT_NONE},
+#endif
 
     /* block device, file system, char device, ... */
     {"bio", kdb_cmdf_bio,  kdb_usgf_bio, 1, KDBX_REPEAT_NONE},

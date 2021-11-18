@@ -108,6 +108,8 @@ extern void kdbx_prnt_addr2sym(pid_t, kdbva_t, char *);
 extern void kdbx_nmi_pause_cpus(struct cpumask);
 extern ulong kdbx_p2m(struct kvm_vcpu *vp, ulong gfn, int slow_ok);
 
+extern void kdbx_print_cstruct(char *name, char *addr);
+
 extern void kdbx_trczero(void);
 extern void kdbx_trcp(void);
 extern void kdbg_trcp(void);

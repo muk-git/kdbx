@@ -11,8 +11,16 @@ KBUILD_CPPFLAGS +=-I$(CURDIR)
 ## KBUILD_CPPFLAGS +=-DKDBX_CONFIG_SWITCH_TO_TTY
 
 obj-y += kdbxmain.o kdbx_cmds.o kdbx_wp.o kdbx_guest.o kdbx_mem_rw.o kdbx_io.o
-obj-y += kdbx_fixup.o
-obj-y += udis86-1.7/
+obj-y += kdbx_fixup.o udis86-1.7/
+
+# to print arbitrary c structures whose strings are compiled in, use this
+ifdef KDBX_CONFIG_CSTRUCTS
+obj-y += kdbx_cstructs.o pahole.o
+endif
+
+ifdef KDBX_CONFIG_PROPRIETARY
+obj-y += proprietary/
+endif
 
 clean:
 	(cd udis86-1.7 && make clean)
