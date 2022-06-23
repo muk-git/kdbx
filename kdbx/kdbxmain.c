@@ -1041,9 +1041,7 @@ void kdbx_trcp(void)
  */
 void kdbx_handle_sysrq_c(int key)
 {
-    // kdbx_print_cstruct("kdbx_testst", NULL);
-    return;
-
+    kdbxp("In kdbx_handle_sysrq_c\n");
     kdbx_trap_immed(KDBX_TRAP_NONFATAL);
 }
 

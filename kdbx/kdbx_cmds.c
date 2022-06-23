@@ -1294,7 +1294,7 @@ static void kdbx_dump_bp_stack(ulong *spaddr, struct pt_regs *regs,
             real_addr = ftrace_graph_ret_addr(task, &graph_idx, addr, spaddr);
 #if 0
             if (real_addr != addr) {
-                kdxp("? ");
+                kdbxp("? ");
                 kdbx_print_instr(addr, 1, 0);
             }
 #endif
@@ -1683,7 +1683,8 @@ _kdb_display_mem(kdbva_t *addrp, int *lenp, int wordsz, pid_t pid, int is_maddr)
         }
         kdbxp(" :");
         for (i=0; i < 16; i++, strp++) {
-            if (!isascii(*strp) || iscntrl(*strp))
+            // if (!isascii(*strp) || iscntrl(*strp))
+            if (!isprint(*strp))
                 kdbxp(".");           /* note: for both dot and ctrl-chars */
             else
                 kdbxp("%c", *strp);
@@ -5278,10 +5279,37 @@ kdb_cmdf_vcpu(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
+static void kdbx_pr_iommu_group(struct iommu_group *ig)
+{
+#if 0
+    >>> move this to drivers/iommu/iommu.c where struct iommu_group is <<
+
+    if (ig == NULL)
+        return;
+
+    kdbxp("    iommu_group: %px (id:$%d name:%s)\n", ig, ig->id, ig->name);
+    kdbxp("      default_domain:%px\n", ig->default_domain);
+
+    struct iommu_group *ig, *tmp;
+    if ((tmp=ig->default_domain) == NULL)
+        goto skip_default_domain;
+    kdbxp("        type:$%d (0==IOMMU_DOMAIN_BLOCKED)  ops:%px\n", 
+          tmp->type, tmp->ops);
+
+skip_default_domain:
+    kdbxp("      domain:%px\n", ig->domain);
+    if ((tmp=ig->domain) == NULL)
+        return;
+    kdbxp("        type:$%d (0==IOMMU_DOMAIN_BLOCKED)  ops:%px\n", 
+          tmp->type, tmp->ops);
+#endif
+}
+
 static void kdbx_disp_struct_device(struct device *dev)
 {
-    kdbxp("  device: name:%s  device_type name:%s\n",
-          dev_name(dev), dev->type ? dev->type->name : "\0"); 
+
+    kdbxp("  struct device (%px): name:%s  device_type name:%s\n",
+          dev, dev_name(dev), dev->type ? dev->type->name : "\0"); 
     kdbxp("    bus_type:{nm:%s devnm:%s} dd:{%s mod:%s}\n",
           dev->bus ? dev->bus->name : "\0", 
           dev->bus ? dev->bus->dev_name : "\0",
@@ -5289,6 +5317,12 @@ static void kdbx_disp_struct_device(struct device *dev)
           dev->driver ? dev->driver->mod_name : "\0");
     kdbxp("    driver_data:%px devt:%x(%u) id:%d\n", dev->driver_data,
           dev->devt, dev->devt, dev->id);
+
+    kdbxp("    DMA: dma_supported: %d  dma_is_direct:%d\n", 
+          dma_supported(dev, *dev->dma_mask), dma_is_direct(get_dma_ops(dev)));
+    kdbxp("    iommu_group: %px\n", dev->iommu_group);
+    kdbx_pr_iommu_group(dev->iommu_group);
+
 }
 
 /* also called from virtio_scsi.c */
@@ -6760,6 +6794,94 @@ kdb_cmdf_buses(int argc, const char **argv, struct pt_regs *regs)
     return KDB_CPU_MAIN_KDB;
 }
 
+static void kdbx_pr_pci_resources(struct pci_dev *pdev)
+{
+    resource_size_t start, end, len;
+    unsigned long i, flags;
+
+    kdbxp("  resources:  start    end    (len)    "
+          "flags(eg: PCI_BASE_ADDRESS_MEM_TYPE_64)\n");
+    for (i=0; i < DEVICE_COUNT_RESOURCE; i++) {
+        flags = pci_resource_flags(pdev, i);
+        if (!(flags & IORESOURCE_MEM || (flags & IORESOURCE_UNSET)))
+            continue;
+
+        if (pci_resource_len(pdev, i) == 0)
+            continue;
+
+        start = pci_resource_start(pdev, i);
+        end = pci_resource_end(pdev, i);
+        len = pci_resource_len(pdev, i);
+        kdbxp("      [%2d]"KDBFL"  "KDBFL" ("KDBFL")  %lx\n",
+              i, start, end, len, flags);
+    }
+}
+
+static void kdbx_pr_pcidev(struct pci_dev *pdev)
+{
+    if (pdev == NULL)
+        return;
+
+    kdbxp("Name: %s  pdev: %px devfn:%x\n", pci_name(pdev), pdev, pdev->devfn);
+    kdbxp("  vendor:%x  device:%x class:%x subsys-vendor:%x subsys-device:%x\n",
+          pdev->vendor, pdev->device, pdev->class, pdev->subsystem_vendor,
+          pdev->subsystem_device);
+
+    kdbx_pr_pci_resources(pdev);
+
+    kdbxp("  intr pin:$%d  dma_mask:%lx\n", pdev->pin, pdev->dma_mask);
+    kdbxp("  dev_flags:%x  enable_cnt:$%d\n", pdev->dev_flags,pdev->enable_cnt);
+    if (pdev->is_physfn) {
+        struct pci_sriov *sriov = pdev->sriov;
+
+        kdbxp("  PF device. sriov info %s\n", sriov ? ":" : "NONE");
+        if (sriov == NULL)
+            goto skip_no_sriov;
+
+        kdbxp("    total_VFs:$%d  initial_VFs:$%d  num_VFs:$%d\n",
+              sriov->total_VFs, sriov->initial_VFs, sriov->num_VFs);
+
+        /* to find and list all VFs: see pci_vfs_assigned() */
+        kdbxp("    vfs devices assigned: $%d\n", pci_vfs_assigned(pdev));
+    } else {
+        kdbxp("  VF device. parent PF pdev: %p\n", pdev->physfn);
+    }
+    kdbxp("  pci_driver: name: %s  struct at: %px\n", pdev->driver->name,
+          pdev->driver);
+    kdbxp("  pci_bus: name: %s  struct at:%px\n", pdev->bus->name, pdev->bus);
+
+    kdbx_disp_struct_device(&pdev->dev);
+
+    kdbxp("\n");
+
+skip_no_sriov:
+    return;
+}
+
+static kdbx_cpu_cmd_t kdb_usgf_pcidev(void)
+{
+    kdbxp("pcidev bdf-name: list pci device info, eg, pcidev 0000:65:00.0\n");
+    return KDB_CPU_MAIN_KDB;
+}
+static kdbx_cpu_cmd_t
+kdb_cmdf_pcidev(int argc, const char **argv, struct pt_regs *regs)
+{
+    char *bdfname = NULL;
+    struct pci_dev *pdev = NULL;   /* include/linux/pci.h */
+
+    /* don't print all devices, not much useful info, lspci is better */
+    if (argc <= 1)
+        return kdb_usgf_pcidev();
+
+    bdfname = (char *)argv[1];
+    for_each_pci_dev(pdev) {
+        if (strcmp(bdfname, pci_name(pdev)) == 0)
+            kdbx_pr_pcidev(pdev);
+    }
+
+    return KDB_CPU_MAIN_KDB;
+}
+
 static kdbx_cpu_cmd_t kdb_usgf_netdevs(void)
 {
     kdbxp("netdevs: list network devices (struct net_device)\n");
@@ -7335,6 +7457,7 @@ void __init kdbx_init_cmdtab(void)
     /* pci related */
     {"resources", kdb_cmdf_resources,  kdb_usgf_resources, 1, KDBX_REPEAT_NONE},
     {"buses", kdb_cmdf_buses,  kdb_usgf_buses, 1, KDBX_REPEAT_NONE},
+    {"pcidev", kdb_cmdf_pcidev,  kdb_usgf_pcidev, 1, KDBX_REPEAT_NONE},
 
     /* network related */
     {"netdevs", kdb_cmdf_netdevs,  kdb_usgf_netdevs, 1, KDBX_REPEAT_NONE},

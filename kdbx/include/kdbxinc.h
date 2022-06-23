@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009, 2020 Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009, Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -115,6 +115,7 @@
 #include "block/blk-mq.h"                  /* don't do relative path */
 #include "block/blk-mq-tag.h"              /* don't do relative path */
 #include "block/blk-wbt.h"                 /* don't do relative path */
+#include "drivers/pci/pci.h"               /* don't do relative path */
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
 #include <asm/text-patching.h>

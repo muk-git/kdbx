@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009 2020 Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009, Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public

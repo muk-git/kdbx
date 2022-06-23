@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009, 2020 Mukesh Rathor, Oracle Corp.  All rights reserved.
+ * Copyright (C) 2009, 2019 Mukesh Rathor, Oracle Corp.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -602,9 +602,10 @@ static char cmds_a[K_CMD_BUFSZ];
 static int kdb_key_valid(int key)
 {
     /* note: isspace() is more than ' ', hence we don't use it here */
+    /* need : for the pcidevs command */
     if (isalnum(key) || key == ' ' || key == K_BACKSPACE || key == '\n' ||
         key == '?' || key == K_UNDERSCORE || key == '=' || key == '!' ||
-        key == '.' )
+        key == '.' || key == ':')
     {
         return 1;
     }
